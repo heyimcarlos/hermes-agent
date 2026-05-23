@@ -380,6 +380,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/api/providers/oauth/{provider_id}/start", adapter._handle_provider_oauth_start)
+    app.router.add_get("/api/providers/oauth/{provider_id}/poll/{session_id}", adapter._handle_provider_oauth_poll)
+    app.router.add_delete("/api/providers/oauth/{provider_id}", adapter._handle_provider_oauth_disconnect)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -617,8 +620,13 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["provider_oauth"]["openai-codex"]["flow"] == "device_code"
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert (
+                data["endpoints"]["provider_oauth_codex_start"]["path"]
+                == "/api/providers/oauth/openai-codex/start"
+            )
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -634,6 +642,123 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+
+# ---------------------------------------------------------------------------
+# Provider OAuth endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestProviderOAuthEndpoint:
+    @pytest.mark.asyncio
+    async def test_codex_start_requires_auth_when_key_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/providers/oauth/openai-codex/start")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_codex_start_returns_device_code_payload(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.provider_oauth.start_codex_device_login",
+            lambda: {
+                "session_id": "session-1",
+                "flow": "device_code",
+                "user_code": "ABCD-1234",
+                "verification_url": "https://auth.openai.com/codex/device",
+                "verification_uri": "https://auth.openai.com/codex/device",
+                "verification_url_complete": "https://auth.openai.com/codex/device",
+                "verification_uri_complete": "https://auth.openai.com/codex/device",
+                "expires_in": 900,
+                "poll_interval": 5,
+                "interval": 5,
+            },
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/oauth/openai-codex/start",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["session_id"] == "session-1"
+            assert data["user_code"] == "ABCD-1234"
+            assert data["verification_url"] == "https://auth.openai.com/codex/device"
+
+    @pytest.mark.asyncio
+    async def test_codex_poll_returns_non_secret_status(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.provider_oauth.poll_codex_device_login",
+            lambda session_id: {
+                "session_id": session_id,
+                "status": "approved",
+                "message": None,
+                "error_message": None,
+                "credential_fingerprint": "tok_...1234",
+                "token_preview": "tok_...1234",
+                "expires_at": None,
+            },
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/providers/oauth/openai-codex/poll/session-1",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "session_id": "session-1",
+                "status": "approved",
+                "message": None,
+                "error_message": None,
+                "credential_fingerprint": "tok_...1234",
+                "token_preview": "tok_...1234",
+                "expires_at": None,
+            }
+
+    @pytest.mark.asyncio
+    async def test_codex_disconnect_clears_provider(self, auth_adapter, monkeypatch):
+        called = {}
+
+        def _disconnect():
+            called["disconnect"] = True
+            return True
+
+        monkeypatch.setattr("hermes_cli.provider_oauth.disconnect_codex", _disconnect)
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete(
+                "/api/providers/oauth/openai-codex",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"ok": True, "provider": "openai-codex"}
+            assert called["disconnect"] is True
+
+    @pytest.mark.asyncio
+    async def test_unsupported_provider_returns_400(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/oauth/anthropic/start",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_provider_routes_exist_for_options_probe(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for path in (
+                "/api/providers/oauth/openai-codex/start",
+                "/api/providers/oauth/openai-codex/poll/session-1",
+                "/api/providers/oauth/openai-codex",
+            ):
+                resp = await cli.options(path)
+                assert resp.status in {200, 204, 403, 405}
 
 
 # ---------------------------------------------------------------------------

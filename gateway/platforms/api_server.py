@@ -968,6 +968,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "provider_oauth": {
+                    "openai-codex": {
+                        "flow": "device_code",
+                        "start": "/api/providers/oauth/openai-codex/start",
+                        "poll": "/api/providers/oauth/openai-codex/poll/{session_id}",
+                        "disconnect": "/api/providers/oauth/openai-codex",
+                    }
+                },
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -983,8 +991,102 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "provider_oauth_codex_start": {
+                    "method": "POST",
+                    "path": "/api/providers/oauth/openai-codex/start",
+                },
+                "provider_oauth_codex_poll": {
+                    "method": "GET",
+                    "path": "/api/providers/oauth/openai-codex/poll/{session_id}",
+                },
+                "provider_oauth_codex_disconnect": {
+                    "method": "DELETE",
+                    "path": "/api/providers/oauth/openai-codex",
+                },
             },
         })
+
+    async def _handle_provider_oauth_start(self, request: "web.Request") -> "web.Response":
+        """POST /api/providers/oauth/{provider_id}/start."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        provider_id = request.match_info.get("provider_id", "")
+        if provider_id != "openai-codex":
+            return web.json_response(
+                _openai_error(f"Unsupported provider OAuth flow: {provider_id}"),
+                status=400,
+            )
+
+        try:
+            from hermes_cli.provider_oauth import start_codex_device_login
+
+            return web.json_response(start_codex_device_login())
+        except Exception as exc:
+            logger.exception("provider oauth start failed for %s", provider_id)
+            return web.json_response(
+                _openai_error(str(exc) or "Provider OAuth start failed"),
+                status=500,
+            )
+
+    async def _handle_provider_oauth_poll(self, request: "web.Request") -> "web.Response":
+        """GET /api/providers/oauth/{provider_id}/poll/{session_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        provider_id = request.match_info.get("provider_id", "")
+        session_id = request.match_info.get("session_id", "")
+        if provider_id != "openai-codex":
+            return web.json_response(
+                _openai_error(f"Unsupported provider OAuth flow: {provider_id}"),
+                status=400,
+            )
+
+        try:
+            from hermes_cli.provider_oauth import poll_codex_device_login
+
+            return web.json_response(poll_codex_device_login(session_id))
+        except KeyError:
+            return web.json_response(
+                _openai_error("Provider OAuth session not found or expired"),
+                status=404,
+            )
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.exception("provider oauth poll failed for %s", provider_id)
+            return web.json_response(
+                _openai_error(str(exc) or "Provider OAuth poll failed"),
+                status=500,
+            )
+
+    async def _handle_provider_oauth_disconnect(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/providers/oauth/{provider_id}."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        provider_id = request.match_info.get("provider_id", "")
+        if provider_id != "openai-codex":
+            return web.json_response(
+                _openai_error(f"Unsupported provider OAuth flow: {provider_id}"),
+                status=400,
+            )
+
+        try:
+            from hermes_cli.provider_oauth import disconnect_codex
+
+            return web.json_response(
+                {"ok": disconnect_codex(), "provider": provider_id}
+            )
+        except Exception as exc:
+            logger.exception("provider oauth disconnect failed for %s", provider_id)
+            return web.json_response(
+                _openai_error(str(exc) or "Provider OAuth disconnect failed"),
+                status=500,
+            )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3365,6 +3467,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_post("/api/providers/oauth/{provider_id}/start", self._handle_provider_oauth_start)
+            self._app.router.add_get("/api/providers/oauth/{provider_id}/poll/{session_id}", self._handle_provider_oauth_poll)
+            self._app.router.add_delete("/api/providers/oauth/{provider_id}", self._handle_provider_oauth_disconnect)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
