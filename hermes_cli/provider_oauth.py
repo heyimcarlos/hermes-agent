@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -18,6 +19,22 @@ _SESSION_TTL_SECONDS = 15 * 60
 
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
+
+
+def start_provider_oauth(provider_id: str) -> Dict[str, Any]:
+    """Start an OAuth flow for a supported provider."""
+    provider = _normalize_provider(provider_id)
+    if provider == CODEX_PROVIDER_ID:
+        return start_codex_device_login()
+    raise ValueError(f"Unsupported provider OAuth flow: {provider_id}")
+
+
+def poll_provider_oauth(provider_id: str, session_id: str) -> Dict[str, Any]:
+    """Return non-secret OAuth session status for a supported provider."""
+    provider = _normalize_provider(provider_id)
+    if provider == CODEX_PROVIDER_ID:
+        return poll_codex_device_login(session_id)
+    raise ValueError(f"Unsupported provider OAuth flow: {provider_id}")
 
 
 def start_codex_device_login() -> Dict[str, Any]:
@@ -163,15 +180,7 @@ def _codex_device_worker(session_id: str) -> None:
             raise RuntimeError("Codex token exchange did not return access_token.")
 
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        from hermes_cli.auth import _save_codex_tokens
-
-        _save_codex_tokens(
-            {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-            },
-            last_refresh,
-        )
+        _persist_codex_device_tokens(access_token, refresh_token, last_refresh)
         _set_session_status(session_id, "approved", None)
     except Exception as exc:
         _set_session_status(session_id, "error", str(exc))
@@ -239,6 +248,41 @@ def _exchange_codex_authorization(code_data: Dict[str, Any]) -> Dict[str, Any]:
     return response.json()
 
 
+def _persist_codex_device_tokens(
+    access_token: str,
+    refresh_token: str,
+    last_refresh: str,
+) -> None:
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        SOURCE_MANUAL,
+        PooledCredential,
+        label_from_token,
+        load_pool,
+    )
+    from hermes_cli.auth import DEFAULT_CODEX_BASE_URL, unsuppress_credential_source
+
+    unsuppress_credential_source(CODEX_PROVIDER_ID, "device_code")
+    pool = load_pool(CODEX_PROVIDER_ID)
+    label = label_from_token(
+        access_token,
+        f"OpenAI Codex {len(pool.entries()) + 1}",
+    )
+    entry = PooledCredential(
+        provider=CODEX_PROVIDER_ID,
+        id=uuid.uuid4().hex[:6],
+        label=label,
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source=f"{SOURCE_MANUAL}:device_code",
+        access_token=access_token,
+        refresh_token=refresh_token or None,
+        base_url=DEFAULT_CODEX_BASE_URL,
+        last_refresh=last_refresh,
+    )
+    pool.add_entry(entry)
+
+
 def _set_session_status(session_id: str, status: str, message: Optional[str]) -> None:
     with _sessions_lock:
         session = _sessions.get(session_id)
@@ -259,3 +303,9 @@ def _codex_token_fingerprint() -> Optional[str]:
         return f"sha256:{digest[:16]}"
     except Exception:
         return None
+
+
+def _normalize_provider(provider_id: str) -> str:
+    from hermes_cli.providers import normalize_provider
+
+    return normalize_provider((provider_id or "").strip())

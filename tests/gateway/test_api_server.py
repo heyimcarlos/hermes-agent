@@ -35,6 +35,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_provider_control import register_provider_control_routes
 
 
 # ---------------------------------------------------------------------------
@@ -382,14 +383,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
-    app.router.add_get("/api/providers", adapter._handle_list_providers)
-    app.router.add_post("/api/providers/oauth/{provider_id}/start", adapter._handle_provider_oauth_start)
-    app.router.add_get("/api/providers/oauth/{provider_id}/poll/{session_id}", adapter._handle_provider_oauth_poll)
-    app.router.add_delete("/api/providers/{provider_id}", adapter._handle_provider_oauth_disconnect)
-    app.router.add_delete("/api/providers/oauth/{provider_id}", adapter._handle_provider_oauth_disconnect)
-    app.router.add_get("/api/model-policy", adapter._handle_model_policy)
-    app.router.add_post("/api/model-policy/validate", adapter._handle_model_policy_validate)
-    app.router.add_post("/api/model-policy/apply", adapter._handle_model_policy_apply)
+    register_provider_control_routes(app, adapter)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -798,7 +792,7 @@ class TestProviderOAuthEndpoint:
 # ---------------------------------------------------------------------------
 
 
-class TestHeadlessControlEndpoints:
+class TestProviderControlEndpoints:
     @pytest.mark.asyncio
     async def test_list_providers_returns_non_secret_status(self, auth_adapter, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")

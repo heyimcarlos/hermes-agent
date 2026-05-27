@@ -1,4 +1,4 @@
-"""Headless provider and model-policy control helpers for API surfaces."""
+"""Provider and model-policy control helpers for API surfaces."""
 
 from __future__ import annotations
 
@@ -374,6 +374,9 @@ def _validate_policy_entry(
     current_provider = _string_or_none(primary.get("provider")) or OPENROUTER_PROVIDER_ID
     current_model = _string_or_none(primary.get("model")) or ""
     current_base_url = _string_or_none(primary.get("base_url")) or ""
+    user_providers = config.get("providers")
+    if not isinstance(user_providers, dict):
+        user_providers = {}
 
     try:
         from hermes_cli.config import get_compatible_custom_providers
@@ -387,7 +390,7 @@ def _validate_policy_entry(
             current_api_key="",
             is_global=False,
             explicit_provider=provider,
-            user_providers=config.get("providers"),
+            user_providers=user_providers,
             custom_providers=get_compatible_custom_providers(config),
         )
     except Exception as exc:

@@ -57,6 +57,10 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms.api_server_provider_control import (
+    provider_control_capabilities,
+    register_provider_control_routes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -945,6 +949,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        provider_control = provider_control_capabilities()
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -975,16 +980,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
-                "provider_oauth": {
-                    "openai-codex": {
-                        "flow": "device_code",
-                        "start": "/api/providers/oauth/openai-codex/start",
-                        "poll": "/api/providers/oauth/openai-codex/poll/{session_id}",
-                        "disconnect": "/api/providers/openai-codex",
-                    }
-                },
-                "provider_status": True,
-                "model_policy": True,
+                **provider_control["features"],
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -1000,198 +996,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
-                "providers": {"method": "GET", "path": "/api/providers"},
-                "provider_oauth_start": {
-                    "method": "POST",
-                    "path": "/api/providers/oauth/{provider}/start",
-                },
-                "provider_oauth_poll": {
-                    "method": "GET",
-                    "path": "/api/providers/oauth/{provider}/poll/{session_id}",
-                },
-                "provider_disconnect": {
-                    "method": "DELETE",
-                    "path": "/api/providers/{provider}",
-                },
-                "model_policy": {"method": "GET", "path": "/api/model-policy"},
-                "model_policy_validate": {
-                    "method": "POST",
-                    "path": "/api/model-policy/validate",
-                },
-                "model_policy_apply": {
-                    "method": "POST",
-                    "path": "/api/model-policy/apply",
-                },
-                "provider_oauth_codex_start": {
-                    "method": "POST",
-                    "path": "/api/providers/oauth/openai-codex/start",
-                },
-                "provider_oauth_codex_poll": {
-                    "method": "GET",
-                    "path": "/api/providers/oauth/openai-codex/poll/{session_id}",
-                },
-                "provider_oauth_codex_disconnect": {
-                    "method": "DELETE",
-                    "path": "/api/providers/openai-codex",
-                },
+                **provider_control["endpoints"],
             },
         })
-
-    async def _handle_list_providers(self, request: "web.Request") -> "web.Response":
-        """GET /api/providers."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        try:
-            from hermes_cli.headless_control import list_providers
-
-            return web.json_response(list_providers())
-        except Exception as exc:
-            logger.exception("provider status listing failed")
-            return web.json_response(
-                _openai_error(str(exc) or "Provider status listing failed"),
-                status=500,
-            )
-
-    async def _handle_model_policy(self, request: "web.Request") -> "web.Response":
-        """GET /api/model-policy."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        try:
-            from hermes_cli.headless_control import get_model_policy
-
-            return web.json_response(get_model_policy())
-        except Exception as exc:
-            logger.exception("model policy read failed")
-            return web.json_response(
-                _openai_error(str(exc) or "Model policy read failed"),
-                status=500,
-            )
-
-    async def _handle_model_policy_validate(self, request: "web.Request") -> "web.Response":
-        """POST /api/model-policy/validate."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
-
-        try:
-            from hermes_cli.headless_control import validate_model_policy
-
-            result = validate_model_policy(body)
-            return web.json_response(result, status=200 if result.get("valid") else 400)
-        except Exception as exc:
-            logger.exception("model policy validation failed")
-            return web.json_response(
-                _openai_error(str(exc) or "Model policy validation failed"),
-                status=500,
-            )
-
-    async def _handle_model_policy_apply(self, request: "web.Request") -> "web.Response":
-        """POST /api/model-policy/apply."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
-
-        try:
-            from hermes_cli.headless_control import apply_model_policy
-
-            result = apply_model_policy(body)
-            return web.json_response(result, status=200 if result.get("ok") else 400)
-        except Exception as exc:
-            logger.exception("model policy apply failed")
-            return web.json_response(
-                _openai_error(str(exc) or "Model policy apply failed"),
-                status=500,
-            )
-
-    async def _handle_provider_oauth_start(self, request: "web.Request") -> "web.Response":
-        """POST /api/providers/oauth/{provider_id}/start."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        provider_id = request.match_info.get("provider_id", "")
-        if provider_id != "openai-codex":
-            return web.json_response(
-                _openai_error(f"Unsupported provider OAuth flow: {provider_id}"),
-                status=400,
-            )
-
-        try:
-            from hermes_cli.provider_oauth import start_codex_device_login
-
-            return web.json_response(start_codex_device_login())
-        except Exception as exc:
-            logger.exception("provider oauth start failed for %s", provider_id)
-            return web.json_response(
-                _openai_error(str(exc) or "Provider OAuth start failed"),
-                status=500,
-            )
-
-    async def _handle_provider_oauth_poll(self, request: "web.Request") -> "web.Response":
-        """GET /api/providers/oauth/{provider_id}/poll/{session_id}."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        provider_id = request.match_info.get("provider_id", "")
-        session_id = request.match_info.get("session_id", "")
-        if provider_id != "openai-codex":
-            return web.json_response(
-                _openai_error(f"Unsupported provider OAuth flow: {provider_id}"),
-                status=400,
-            )
-
-        try:
-            from hermes_cli.provider_oauth import poll_codex_device_login
-
-            return web.json_response(poll_codex_device_login(session_id))
-        except KeyError:
-            return web.json_response(
-                _openai_error("Provider OAuth session not found or expired"),
-                status=404,
-            )
-        except ValueError as exc:
-            return web.json_response(_openai_error(str(exc)), status=400)
-        except Exception as exc:
-            logger.exception("provider oauth poll failed for %s", provider_id)
-            return web.json_response(
-                _openai_error(str(exc) or "Provider OAuth poll failed"),
-                status=500,
-            )
-
-    async def _handle_provider_oauth_disconnect(self, request: "web.Request") -> "web.Response":
-        """DELETE /api/providers/{provider_id}."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-
-        provider_id = request.match_info.get("provider_id", "")
-        try:
-            from hermes_cli.headless_control import disconnect_provider
-
-            return web.json_response(disconnect_provider(provider_id))
-        except ValueError as exc:
-            return web.json_response(_openai_error(str(exc)), status=400)
-        except Exception as exc:
-            logger.exception("provider oauth disconnect failed for %s", provider_id)
-            return web.json_response(
-                _openai_error(str(exc) or "Provider OAuth disconnect failed"),
-                status=500,
-            )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3572,14 +3379,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
-            self._app.router.add_get("/api/providers", self._handle_list_providers)
-            self._app.router.add_post("/api/providers/oauth/{provider_id}/start", self._handle_provider_oauth_start)
-            self._app.router.add_get("/api/providers/oauth/{provider_id}/poll/{session_id}", self._handle_provider_oauth_poll)
-            self._app.router.add_delete("/api/providers/{provider_id}", self._handle_provider_oauth_disconnect)
-            self._app.router.add_delete("/api/providers/oauth/{provider_id}", self._handle_provider_oauth_disconnect)
-            self._app.router.add_get("/api/model-policy", self._handle_model_policy)
-            self._app.router.add_post("/api/model-policy/validate", self._handle_model_policy_validate)
-            self._app.router.add_post("/api/model-policy/apply", self._handle_model_policy_apply)
+            register_provider_control_routes(self._app, self)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
