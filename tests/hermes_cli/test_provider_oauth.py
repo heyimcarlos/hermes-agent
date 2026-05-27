@@ -43,8 +43,8 @@ def test_codex_device_login_persists_tokens_without_returning_them(monkeypatch):
     )
     monkeypatch.setattr(
         provider_oauth,
-        "_codex_token_preview",
-        lambda: "acce...oken",
+        "_codex_token_fingerprint",
+        lambda: "sha256:9e0a7f2a5c4f8b21",
     )
 
     started = provider_oauth.start_codex_device_login()
@@ -61,7 +61,7 @@ def test_codex_device_login_persists_tokens_without_returning_them(monkeypatch):
     assert "access-secret-token" not in str(started)
     assert "refresh-secret-token" not in str(started)
     assert polled["status"] == "approved"
-    assert polled["credential_fingerprint"] == "acce...oken"
+    assert polled["credential_fingerprint"] == "sha256:9e0a7f2a5c4f8b21"
     assert "access-secret-token" not in str(polled)
     assert saved["tokens"] == {
         "access_token": "access-secret-token",

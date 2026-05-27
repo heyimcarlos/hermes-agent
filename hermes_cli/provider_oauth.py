@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import threading
 import time
@@ -73,7 +74,7 @@ def poll_codex_device_login(session_id: str) -> Dict[str, Any]:
 
     credential_fingerprint: Optional[str] = None
     if session.get("status") == "approved":
-        credential_fingerprint = _codex_token_preview()
+        credential_fingerprint = _codex_token_fingerprint()
 
     return {
         "session_id": session_id,
@@ -246,7 +247,7 @@ def _set_session_status(session_id: str, status: str, message: Optional[str]) ->
             session["error_message"] = message
 
 
-def _codex_token_preview() -> Optional[str]:
+def _codex_token_fingerprint() -> Optional[str]:
     try:
         from hermes_cli.auth import get_codex_auth_status
 
@@ -254,8 +255,7 @@ def _codex_token_preview() -> Optional[str]:
         token = str(raw.get("api_key") or "")
         if not token:
             return None
-        if len(token) <= 10:
-            return token
-        return f"{token[:4]}...{token[-4:]}"
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return f"sha256:{digest[:16]}"
     except Exception:
         return None
