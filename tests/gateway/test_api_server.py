@@ -321,7 +321,7 @@ class TestAdapterInit:
                 "api_mode": "codex_responses",
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *_: "gpt-5.5")
         monkeypatch.setattr(
             "gateway.run._load_gateway_config",
             lambda: {"agent": {"reasoning_effort": "xhigh"}},

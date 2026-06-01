@@ -2595,6 +2595,7 @@ class GatewayRunner:
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        runtime_policy: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -2609,7 +2610,11 @@ class GatewayRunner:
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(user_config)
+        if runtime_policy is not None:
+            user_config = runtime_policy["user_config"]
+            model = runtime_policy["model"]
+        else:
+            model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -2640,7 +2645,10 @@ class GatewayRunner:
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if runtime_policy is not None and "runtime_kwargs" in runtime_policy:
+            runtime_kwargs = dict(runtime_policy["runtime_kwargs"])
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -3309,6 +3317,36 @@ class GatewayRunner:
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _resolve_current_runtime_policy(
+        user_config: Optional[dict] = None,
+        *,
+        resolve_runtime: bool = True,
+    ) -> dict:
+        """Resolve the current model/runtime/fallback policy for a new agent.
+
+        Both HTTP API-server chat turns and native platform turns create
+        Gateway-owned AIAgent instances. Keep their runtime config resolution
+        shared so long-lived messaging adapters see the same provider/model
+        policy as fresh /chat requests.
+        """
+        resolved_config = user_config if user_config is not None else _load_gateway_config()
+        policy = {
+            "user_config": resolved_config,
+            "model": _resolve_gateway_model(resolved_config),
+            "fallback_model": GatewayRunner._load_fallback_model(),
+            "reasoning_config": GatewayRunner._load_reasoning_config(),
+        }
+        if resolve_runtime:
+            policy["runtime_kwargs"] = _resolve_runtime_agent_kwargs()
+        return policy
+
+    def _refresh_runtime_model_policy(self) -> dict:
+        """Reload model policy values that can change while Gateway is running."""
+        runtime_policy = self._resolve_current_runtime_policy(resolve_runtime=False)
+        self._fallback_model = runtime_policy["fallback_model"]
+        return runtime_policy
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {
@@ -17707,12 +17745,14 @@ class GatewayRunner:
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
             _reload_runtime_env_preserving_config_authority()
+            runtime_policy = self._refresh_runtime_model_policy()
+            user_config = runtime_policy["user_config"]
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
-                    user_config=user_config,
+                    runtime_policy=runtime_policy,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
