@@ -21,6 +21,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/model-policy           — active provider/model/fallback policy
 - POST /api/model-policy/validate  — validate provider/model/fallback policy
 - POST /api/model-policy/apply     — persist provider/model/fallback policy
+- POST /api/model-policy/activate  — validate, apply, smoke, and restore on failure
 - GET  /api/platforms              — platform connection status
 - GET  /api/platforms/{platform}   — one platform's connection status
 - POST /api/platforms/{platform}/configure — validate, persist, and apply platform config
@@ -3514,6 +3515,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return result, usage
 
         return await loop.run_in_executor(None, _run)
+
+    async def _smoke_model_policy(self) -> Dict[str, Any]:
+        """Run a minimal turn through the active model policy."""
+        result, usage = await self._run_agent(
+            user_message="Reply with OK to confirm the active model policy works.",
+            conversation_history=[],
+            ephemeral_system_prompt=(
+                "You are validating the active Hermes model policy. "
+                "Do not call tools. Reply with OK."
+            ),
+            session_id=f"api-model-policy-smoke-{uuid.uuid4().hex[:8]}",
+            gateway_session_key=None,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Model policy smoke returned an invalid result")
+        if result.get("failed") or result.get("partial"):
+            raise RuntimeError(str(result.get("error") or "Model policy smoke failed"))
+        if not str(result.get("final_response") or "").strip():
+            raise RuntimeError("Model policy smoke did not produce a response")
+        return {"ok": True, "usage": usage if isinstance(usage, dict) else {}}
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

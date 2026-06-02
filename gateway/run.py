@@ -1592,6 +1592,24 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _resolve_gateway_max_tokens(config: dict | None = None) -> Optional[int]:
+    """Read model.max_tokens from config.yaml for gateway-created agents."""
+    cfg = config if config is not None else _load_gateway_config()
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        return None
+
+    raw = model_cfg.get("max_tokens")
+    if raw is None or isinstance(raw, bool):
+        return None
+
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -2625,6 +2643,9 @@ class GatewayRunner:
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
             }
+            max_tokens = _resolve_gateway_max_tokens(user_config)
+            if max_tokens is not None:
+                override_runtime["max_tokens"] = max_tokens
             if override_runtime.get("api_key"):
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
@@ -2647,8 +2668,16 @@ class GatewayRunner:
 
         if runtime_policy is not None and "runtime_kwargs" in runtime_policy:
             runtime_kwargs = dict(runtime_policy["runtime_kwargs"])
+            max_tokens = runtime_policy.get("max_tokens")
+            if max_tokens is None:
+                max_tokens = _resolve_gateway_max_tokens(user_config)
+            if max_tokens is not None:
+                runtime_kwargs.setdefault("max_tokens", max_tokens)
         else:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_tokens = _resolve_gateway_max_tokens(user_config)
+            if max_tokens is not None:
+                runtime_kwargs["max_tokens"] = max_tokens
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -2726,6 +2755,8 @@ class GatewayRunner:
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        if runtime_kwargs.get("max_tokens") is not None:
+            runtime["max_tokens"] = runtime_kwargs.get("max_tokens")
         route = {
             "model": model,
             "runtime": runtime,
@@ -2736,6 +2767,7 @@ class GatewayRunner:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                runtime.get("max_tokens"),
             ),
         }
 
@@ -3332,14 +3364,19 @@ class GatewayRunner:
         policy as fresh /chat requests.
         """
         resolved_config = user_config if user_config is not None else _load_gateway_config()
+        max_tokens = _resolve_gateway_max_tokens(resolved_config)
         policy = {
             "user_config": resolved_config,
             "model": _resolve_gateway_model(resolved_config),
             "fallback_model": GatewayRunner._load_fallback_model(),
             "reasoning_config": GatewayRunner._load_reasoning_config(),
+            "max_tokens": max_tokens,
         }
         if resolve_runtime:
-            policy["runtime_kwargs"] = _resolve_runtime_agent_kwargs()
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if max_tokens is not None:
+                runtime_kwargs["max_tokens"] = max_tokens
+            policy["runtime_kwargs"] = runtime_kwargs
         return policy
 
     def _refresh_runtime_model_policy(self) -> dict:

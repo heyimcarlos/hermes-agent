@@ -179,6 +179,40 @@ class TestGatewayEmptyModelFallback:
         assert kwargs["provider"] == "openrouter"
         assert kwargs["api_key"] == "fresh-key"
 
+    def test_session_runtime_honors_policy_max_tokens(self):
+        """Platform turns should not fall back to provider-profile token defaults."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runtime_policy = {
+            "user_config": {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "nvidia/nemotron-3-super-120b-a12b:free",
+                    "max_tokens": 1024,
+                },
+            },
+            "model": "nvidia/nemotron-3-super-120b-a12b:free",
+            "max_tokens": 1024,
+            "runtime_kwargs": {
+                "provider": "openrouter",
+                "api_key": "fresh-key",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+            "fallback_model": [],
+        }
+
+        model, kwargs = runner._resolve_session_agent_runtime(
+            runtime_policy=runtime_policy,
+        )
+        turn_route = runner._resolve_turn_agent_config("hello", model, kwargs)
+
+        assert model == "nvidia/nemotron-3-super-120b-a12b:free"
+        assert kwargs["max_tokens"] == 1024
+        assert turn_route["runtime"]["max_tokens"] == 1024
+
     def test_refresh_policy_defers_runtime_resolution_until_session_overrides(self):
         """Refreshing platform policy must not bypass complete session overrides."""
         from gateway.run import GatewayRunner
