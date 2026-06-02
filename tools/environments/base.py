@@ -52,6 +52,23 @@ def _get_activity_callback() -> Callable[[str], None] | None:
     return getattr(_activity_callback_local, "callback", None)
 
 
+def preserve_virtualenv_path_prelude() -> str:
+    """Shell prelude that keeps an activated Python venv visible after login rc.
+
+    Some login shells reset PATH after Docker/systemd entrypoints activate the
+    Hermes venv. The Python process still has VIRTUAL_ENV, so re-prepend its
+    bin dir before capturing or running terminal commands.
+    """
+    return (
+        'if [ -n "${VIRTUAL_ENV:-}" ] && [ -d "${VIRTUAL_ENV}/bin" ]; then\n'
+        '  case ":${PATH:-}:" in\n'
+        '    *":${VIRTUAL_ENV}/bin:"*) ;;\n'
+        '    *) export PATH="${VIRTUAL_ENV}/bin:${PATH:-}" ;;\n'
+        "  esac\n"
+        "fi"
+    )
+
+
 def touch_activity_if_due(
     state: dict,
     label: str,
@@ -370,6 +387,7 @@ class BaseEnvironment(ABC):
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
         bootstrap = (
+            f"{preserve_virtualenv_path_prelude()}\n"
             f"export -p > {_quoted_snap}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
             f"alias -p >> {_quoted_snap}\n"
@@ -438,6 +456,8 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+
+        parts.append(preserve_virtualenv_path_prelude())
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
