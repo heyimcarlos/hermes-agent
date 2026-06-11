@@ -3324,10 +3324,15 @@ class GatewayRunner:
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
-                return cfg.get("provider_routing", {}) or {}
+                return GatewayRunner._provider_routing_from_config(cfg)
         except Exception:
             pass
         return {}
+
+    @staticmethod
+    def _provider_routing_from_config(config: dict) -> dict:
+        routing = config.get("provider_routing") if isinstance(config, dict) else {}
+        return routing if isinstance(routing, dict) else {}
 
     @staticmethod
     def _load_fallback_model() -> list | None:
@@ -3371,6 +3376,9 @@ class GatewayRunner:
             "fallback_model": GatewayRunner._load_fallback_model(),
             "reasoning_config": GatewayRunner._load_reasoning_config(),
             "max_tokens": max_tokens,
+            "provider_routing": GatewayRunner._provider_routing_from_config(
+                resolved_config
+            ),
         }
         if resolve_runtime:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -3383,6 +3391,7 @@ class GatewayRunner:
         """Reload model policy values that can change while Gateway is running."""
         runtime_policy = self._resolve_current_runtime_policy(resolve_runtime=False)
         self._fallback_model = runtime_policy["fallback_model"]
+        self._provider_routing = runtime_policy.get("provider_routing", {})
         return runtime_policy
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:

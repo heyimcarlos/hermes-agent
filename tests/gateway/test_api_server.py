@@ -327,6 +327,14 @@ class TestAdapterInit:
             lambda: {
                 "agent": {"reasoning_effort": "xhigh"},
                 "model": {"max_tokens": 1024},
+                "provider_routing": {
+                    "only": ["openrouter"],
+                    "ignore": ["provider-without-free-routes"],
+                    "order": ["openrouter"],
+                    "sort": "price",
+                    "require_parameters": True,
+                    "data_collection": "deny",
+                },
             },
         )
         monkeypatch.setattr(
@@ -344,6 +352,12 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
         assert captured["max_tokens"] == 1024
+        assert captured["providers_allowed"] == ["openrouter"]
+        assert captured["providers_ignored"] == ["provider-without-free-routes"]
+        assert captured["providers_order"] == ["openrouter"]
+        assert captured["provider_sort"] == "price"
+        assert captured["provider_require_parameters"] is True
+        assert captured["provider_data_collection"] == "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1147,71 @@ class TestProviderControlEndpoints:
         assert data["policy"]["primary"]["provider"] == "openrouter"
         assert data["attempted_policy"]["primary"]["provider"] == "openai-codex"
         auth_adapter._smoke_model_policy.assert_awaited_once()
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original_snapshot
+
+    @pytest.mark.asyncio
+    async def test_model_policy_activate_restores_raw_config_when_refresh_fails(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        original_config = {
+            "agent": {"max_turns": 90},
+            "model": {
+                "provider": "openrouter",
+                "default": "openrouter/free",
+                "max_tokens": 1024,
+            },
+            "unrelated": {"keep": True},
+        }
+        config_path.write_text(yaml.safe_dump(original_config), encoding="utf-8")
+        from hermes_cli.provider_control import snapshot_model_policy_config
+
+        original_snapshot = snapshot_model_policy_config()
+
+        def fake_switch_model(raw_input, explicit_provider, **_kwargs):
+            return SimpleNamespace(
+                success=True,
+                new_model=raw_input,
+                target_provider=explicit_provider,
+                base_url="https://api.openai.com/v1",
+                api_mode="codex_responses",
+            )
+
+        monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+        auth_adapter._refresh_runtime_model_policy = MagicMock(
+            side_effect=RuntimeError("runtime refresh failed")
+        )
+        auth_adapter._smoke_model_policy = AsyncMock(return_value={"ok": True})
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/activate",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={
+                    "primary": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.3-codex",
+                    },
+                    "fallbacks": [],
+                },
+            )
+            assert resp.status == 500
+            data = await resp.json()
+
+        assert data["ok"] is False
+        assert data["activated"] is False
+        assert data["restored"] is True
+        assert data["restore_error"] == "runtime refresh failed"
+        assert data["smoke"] == {
+            "ok": False,
+            "error": "runtime refresh failed",
+        }
+        auth_adapter._smoke_model_policy.assert_not_awaited()
         assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original_snapshot
 
     @pytest.mark.asyncio
