@@ -41,6 +41,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+from tools.environments.base import preserve_virtualenv_path_prelude
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -717,8 +718,11 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                command_with_prelude = (
+                    f"{preserve_virtualenv_path_prelude()}\nset +m; {command}"
+                )
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
+                    [user_shell, "-lic", command_with_prelude],
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -761,8 +765,11 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
+        command_with_prelude = (
+            f"{preserve_virtualenv_path_prelude()}\nset +m; {command}"
+        )
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            [user_shell, "-lic", command_with_prelude],
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -854,7 +861,10 @@ class ProcessRegistry:
         log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
         pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
         exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
-        quoted_command = shlex.quote(command)
+        command_with_prelude = (
+            f"{preserve_virtualenv_path_prelude()}\n{command}"
+        )
+        quoted_command = shlex.quote(command_with_prelude)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)

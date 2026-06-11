@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -140,7 +141,6 @@ class TestGetAndPoll:
         assert result["status"] == "exited"
         assert result["exit_code"] == 0
 
-
 def test_request_close_terminal_without_sink_is_desktop_only_error(registry):
     """No UI close sink wired (CLI/messaging) → clear desktop-only error, no raise."""
     s = _make_session(sid="proc_close_nosink")
@@ -251,6 +251,49 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
     assert session.exited is True
     assert session.exit_code == 0
     assert moved == ["proc_reader_live"]
+
+
+class TestSpawnLocalEnvironment:
+    def test_preserves_entrypoint_virtualenv_after_login_path_reset(
+        self, registry, tmp_path, monkeypatch
+    ):
+        real_bash = shutil.which("bash")
+        if not real_bash:
+            pytest.skip("requires bash")
+
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        hermes = venv_bin / "hermes"
+        hermes.write_text("#!/bin/sh\necho bg-venv-hermes\n")
+        hermes.chmod(0o755)
+
+        fake_bash = tmp_path / "fake-bash"
+        fake_bash.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-l" ] || [ "$1" = "-lic" ]; then\n'
+            "  first=\"$1\"\n"
+            "  shift\n"
+            '  export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"\n'
+            f"  exec {real_bash} \"$first\" \"$@\"\n"
+            "fi\n"
+            f"exec {real_bash} \"$@\"\n"
+        )
+        fake_bash.chmod(0o755)
+
+        monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "venv"))
+        monkeypatch.setenv("PATH", f"{venv_bin}:{os.environ.get('PATH', '')}")
+
+        with patch("tools.process_registry._find_shell", return_value=str(fake_bash)):
+            session = registry.spawn_local(
+                'command -v hermes; hermes',
+                cwd=str(tmp_path),
+            )
+            result = registry.wait(session.id, timeout=5)
+
+        assert result["status"] == "exited"
+        assert result["exit_code"] == 0
+        assert str(venv_bin / "hermes") in result["output"]
+        assert "bg-venv-hermes" in result["output"]
 
 
 # =========================================================================
