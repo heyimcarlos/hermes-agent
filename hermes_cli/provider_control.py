@@ -156,6 +156,19 @@ def apply_model_policy(payload: Any) -> Dict[str, Any]:
     }
 
 
+def snapshot_model_policy_config() -> Dict[str, Any]:
+    """Return the raw config snapshot used for model-policy rollback."""
+    return _read_raw_config()
+
+
+def restore_model_policy_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore a raw config snapshot after failed policy activation."""
+    from hermes_cli.config import save_config
+
+    save_config(dict(config))
+    return get_model_policy()
+
+
 def _provider_status(provider: str, policy: Dict[str, Any]) -> Dict[str, Any]:
     if provider == CODEX_PROVIDER_ID:
         return _codex_status(policy)

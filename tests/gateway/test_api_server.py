@@ -350,10 +350,21 @@ class TestAdapterInit:
                 "api_mode": "codex_responses",
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *_: "gpt-5.5")
         monkeypatch.setattr(
             "gateway.run._load_gateway_config",
-            lambda: {"agent": {"reasoning_effort": "xhigh"}},
+            lambda: {
+                "agent": {"reasoning_effort": "xhigh"},
+                "model": {"max_tokens": 1024},
+                "provider_routing": {
+                    "only": ["openrouter"],
+                    "ignore": ["provider-without-free-routes"],
+                    "order": ["openrouter"],
+                    "sort": "price",
+                    "require_parameters": True,
+                    "data_collection": "deny",
+                },
+            },
         )
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
@@ -369,6 +380,13 @@ class TestAdapterInit:
 
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert captured["max_tokens"] == 1024
+        assert captured["providers_allowed"] == ["openrouter"]
+        assert captured["providers_ignored"] == ["provider-without-free-routes"]
+        assert captured["providers_order"] == ["openrouter"]
+        assert captured["provider_sort"] == "price"
+        assert captured["provider_require_parameters"] is True
+        assert captured["provider_data_collection"] == "deny"
 
     def test_create_agent_refreshes_max_iterations_from_runtime_config(self, monkeypatch):
         captured = {}
@@ -386,7 +404,7 @@ class TestAdapterInit:
                 "api_mode": "chat_completions",
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *_: "gpt-5")
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"agent": {"max_turns": 200}})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
@@ -900,6 +918,7 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["providers"]["path"] == "/api/providers"
             assert data["endpoints"]["model_policy_apply"]["path"] == "/api/model-policy/apply"
+            assert data["endpoints"]["model_policy_activate"]["path"] == "/api/model-policy/activate"
             assert data["endpoints"]["platform_configure"]["path"] == "/api/platforms/{platform}/configure"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
@@ -1230,6 +1249,229 @@ class TestProviderControlEndpoints:
         assert data["errors"] == [
             {"path": "primary.model", "message": "Model is required."}
         ]
+
+    @pytest.mark.asyncio
+    async def test_model_policy_activate_smokes_and_persists_policy(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        config_path.write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.3-codex\n"
+            "  base_url: https://api.openai.com/v1\n"
+            "  api_mode: codex_responses\n"
+            "  max_tokens: 1024\n",
+            encoding="utf-8",
+        )
+
+        def fake_switch_model(raw_input, explicit_provider, **_kwargs):
+            return SimpleNamespace(
+                success=True,
+                new_model=raw_input,
+                target_provider=explicit_provider,
+                base_url=None,
+                api_mode=None,
+            )
+
+        monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+        auth_adapter._smoke_model_policy = AsyncMock(return_value={"ok": True})
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/activate",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={
+                    "primary": {
+                        "provider": "openrouter",
+                        "model": "nvidia/nemotron-3-super-120b-a12b:free",
+                    },
+                    "fallbacks": [],
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["activated"] is True
+        assert data["smoke"]["ok"] is True
+        auth_adapter._smoke_model_policy.assert_awaited_once()
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["model"]["provider"] == "openrouter"
+        assert saved["model"]["default"] == "nvidia/nemotron-3-super-120b-a12b:free"
+        assert saved["model"]["max_tokens"] == 1024
+        assert "base_url" not in saved["model"]
+        assert "api_mode" not in saved["model"]
+
+    @pytest.mark.asyncio
+    async def test_model_policy_activate_restores_raw_config_when_smoke_fails(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        original_config = {
+            "agent": {"max_turns": 90},
+            "model": {
+                "provider": "openrouter",
+                "default": "openrouter/free",
+                "max_tokens": 1024,
+            },
+            "fallback_model": {
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-chat",
+            },
+            "unrelated": {"keep": True},
+        }
+        config_path.write_text(yaml.safe_dump(original_config), encoding="utf-8")
+        from hermes_cli.provider_control import snapshot_model_policy_config
+
+        original_snapshot = snapshot_model_policy_config()
+
+        def fake_switch_model(raw_input, explicit_provider, **_kwargs):
+            return SimpleNamespace(
+                success=True,
+                new_model=raw_input,
+                target_provider=explicit_provider,
+                base_url="https://api.openai.com/v1",
+                api_mode="codex_responses",
+            )
+
+        monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+        auth_adapter._smoke_model_policy = AsyncMock(
+            side_effect=RuntimeError("HTTP 402: fewer max_tokens required")
+        )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/activate",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={
+                    "primary": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.3-codex",
+                    },
+                    "fallbacks": [],
+                },
+            )
+            assert resp.status == 409
+            data = await resp.json()
+
+        assert data["ok"] is False
+        assert data["activated"] is False
+        assert data["restored"] is True
+        assert data["smoke"] == {
+            "ok": False,
+            "error": "HTTP 402: fewer max_tokens required",
+        }
+        assert data["policy"]["primary"]["provider"] == "openrouter"
+        assert data["attempted_policy"]["primary"]["provider"] == "openai-codex"
+        auth_adapter._smoke_model_policy.assert_awaited_once()
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original_snapshot
+
+    @pytest.mark.asyncio
+    async def test_model_policy_activate_restores_raw_config_when_refresh_fails(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        original_config = {
+            "agent": {"max_turns": 90},
+            "model": {
+                "provider": "openrouter",
+                "default": "openrouter/free",
+                "max_tokens": 1024,
+            },
+            "unrelated": {"keep": True},
+        }
+        config_path.write_text(yaml.safe_dump(original_config), encoding="utf-8")
+        from hermes_cli.provider_control import snapshot_model_policy_config
+
+        original_snapshot = snapshot_model_policy_config()
+
+        def fake_switch_model(raw_input, explicit_provider, **_kwargs):
+            return SimpleNamespace(
+                success=True,
+                new_model=raw_input,
+                target_provider=explicit_provider,
+                base_url="https://api.openai.com/v1",
+                api_mode="codex_responses",
+            )
+
+        monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+        auth_adapter._refresh_runtime_model_policy = MagicMock(
+            side_effect=RuntimeError("runtime refresh failed")
+        )
+        auth_adapter._smoke_model_policy = AsyncMock(return_value={"ok": True})
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/activate",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={
+                    "primary": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.3-codex",
+                    },
+                    "fallbacks": [],
+                },
+            )
+            assert resp.status == 500
+            data = await resp.json()
+
+        assert data["ok"] is False
+        assert data["activated"] is False
+        assert data["restored"] is True
+        assert data["restore_error"] == "runtime refresh failed"
+        assert data["smoke"] == {
+            "ok": False,
+            "error": "runtime refresh failed",
+        }
+        auth_adapter._smoke_model_policy.assert_not_awaited()
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == original_snapshot
+
+    @pytest.mark.asyncio
+    async def test_model_policy_activate_rejects_invalid_policy_without_mutating(
+        self,
+        auth_adapter,
+    ):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        original_text = "model:\n  provider: openrouter\n  default: openrouter/free\n"
+        config_path.write_text(original_text, encoding="utf-8")
+        auth_adapter._smoke_model_policy = AsyncMock(return_value={"ok": True})
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/activate",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"primary": {"provider": "openrouter"}},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+
+        assert data["ok"] is False
+        assert data["activated"] is False
+        assert data["errors"] == [
+            {"path": "primary.model", "message": "Model is required."}
+        ]
+        auth_adapter._smoke_model_policy.assert_not_awaited()
+        assert config_path.read_text(encoding="utf-8") == original_text
 
 
 # ---------------------------------------------------------------------------

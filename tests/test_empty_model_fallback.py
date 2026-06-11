@@ -74,6 +74,194 @@ class TestGetDefaultModelForProvider:
 class TestGatewayEmptyModelFallback:
     """Test that _resolve_session_agent_runtime fills in empty model from provider catalog."""
 
+    def test_current_runtime_policy_resolves_model_runtime_and_fallbacks(self):
+        """Gateway-created agents share one current runtime policy resolver."""
+        from gateway.run import GatewayRunner
+
+        refreshed_fallbacks = [
+            {"provider": "openrouter", "model": "deepseek/deepseek-chat"}
+        ]
+        runtime_kwargs = {
+            "provider": "openrouter",
+            "api_key": "test-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        }
+
+        with patch("gateway.run._load_gateway_config", return_value={
+            "model": {"provider": "openrouter", "default": "openrouter/free"},
+            "fallback_providers": refreshed_fallbacks,
+        }), patch("gateway.run._resolve_runtime_agent_kwargs", return_value=runtime_kwargs), \
+             patch.object(
+                 GatewayRunner,
+                 "_load_fallback_model",
+                 return_value=refreshed_fallbacks,
+             ), patch.object(
+                 GatewayRunner,
+                 "_load_reasoning_config",
+                 return_value={"enabled": True, "effort": "medium"},
+             ):
+            runtime_policy = GatewayRunner._resolve_current_runtime_policy()
+
+        assert runtime_policy["user_config"]["model"]["provider"] == "openrouter"
+        assert runtime_policy["model"] == "openrouter/free"
+        assert runtime_policy["runtime_kwargs"] == runtime_kwargs
+        assert runtime_policy["fallback_model"] == refreshed_fallbacks
+        assert runtime_policy["reasoning_config"] == {
+            "enabled": True,
+            "effort": "medium",
+        }
+
+    def test_refresh_runtime_model_policy_updates_cached_fallbacks(self):
+        """Gateway platform turns should see model-policy changes made after startup."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._fallback_model = None
+        refreshed_fallbacks = [
+            {"provider": "openrouter", "model": "deepseek/deepseek-chat"}
+        ]
+
+        with patch.object(
+            GatewayRunner,
+            "_resolve_current_runtime_policy",
+            return_value={
+                "user_config": {
+                    "model": {
+                        "provider": "openrouter",
+                        "default": "openrouter/free",
+                    },
+                },
+                "model": "openrouter/free",
+                "fallback_model": refreshed_fallbacks,
+                "reasoning_config": None,
+            },
+        ):
+            runtime_policy = runner._refresh_runtime_model_policy()
+
+        assert runtime_policy["user_config"]["model"]["provider"] == "openrouter"
+        assert runner._fallback_model == refreshed_fallbacks
+
+    def test_session_runtime_uses_supplied_current_policy(self):
+        """Platform turns should consume freshly resolved policy, not stale globals."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runtime_policy = {
+            "user_config": {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "openrouter/free",
+                },
+            },
+            "model": "openrouter/free",
+            "runtime_kwargs": {
+                "provider": "openrouter",
+                "api_key": "fresh-key",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+            "fallback_model": [
+                {"provider": "openai-codex", "model": "gpt-5.1-codex"}
+            ],
+        }
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=AssertionError("stale resolver should not be called"),
+        ):
+            model, kwargs = runner._resolve_session_agent_runtime(
+                runtime_policy=runtime_policy,
+            )
+
+        assert model == "openrouter/free"
+        assert kwargs["provider"] == "openrouter"
+        assert kwargs["api_key"] == "fresh-key"
+
+    def test_session_runtime_honors_policy_max_tokens(self):
+        """Platform turns should not fall back to provider-profile token defaults."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runtime_policy = {
+            "user_config": {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "nvidia/nemotron-3-super-120b-a12b:free",
+                    "max_tokens": 1024,
+                },
+            },
+            "model": "nvidia/nemotron-3-super-120b-a12b:free",
+            "max_tokens": 1024,
+            "runtime_kwargs": {
+                "provider": "openrouter",
+                "api_key": "fresh-key",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+            "fallback_model": [],
+        }
+
+        model, kwargs = runner._resolve_session_agent_runtime(
+            runtime_policy=runtime_policy,
+        )
+        turn_route = runner._resolve_turn_agent_config("hello", model, kwargs)
+
+        assert model == "nvidia/nemotron-3-super-120b-a12b:free"
+        assert kwargs["max_tokens"] == 1024
+        assert turn_route["runtime"]["max_tokens"] == 1024
+
+    def test_refresh_policy_defers_runtime_resolution_until_session_overrides(self):
+        """Refreshing platform policy must not bypass complete session overrides."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._fallback_model = None
+        runtime_policy = {
+            "user_config": {
+                "model": {
+                    "provider": "openrouter",
+                    "default": "openrouter/free",
+                },
+            },
+            "model": "openrouter/free",
+            "fallback_model": [],
+            "reasoning_config": None,
+        }
+
+        with patch.object(
+            GatewayRunner,
+            "_resolve_current_runtime_policy",
+            return_value=runtime_policy,
+        ):
+            refreshed = runner._refresh_runtime_model_policy()
+
+        assert "runtime_kwargs" not in refreshed
+
+        runner._session_model_overrides = {
+            "agent:main:discord:thread:channel-1:thread-1": {
+                "model": "codex/session-model",
+                "provider": "openai-codex",
+                "api_key": "session-key",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+            }
+        }
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=AssertionError("global runtime should not be resolved"),
+        ):
+            model, kwargs = runner._resolve_session_agent_runtime(
+                session_key="agent:main:discord:thread:channel-1:thread-1",
+                runtime_policy=refreshed,
+            )
+
+        assert model == "codex/session-model"
+        assert kwargs["api_key"] == "session-key"
+
     def test_empty_model_filled_from_provider(self):
         """When config has no model but provider is openai-codex, use first codex model."""
         from gateway.run import GatewayRunner

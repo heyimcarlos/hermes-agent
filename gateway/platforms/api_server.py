@@ -21,6 +21,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/model-policy           — active provider/model/fallback policy
 - POST /api/model-policy/validate  — validate provider/model/fallback policy
 - POST /api/model-policy/apply     — persist provider/model/fallback policy
+- POST /api/model-policy/activate  — validate, apply, smoke, and restore on failure
 - GET  /api/platforms              — platform connection status
 - GET  /api/platforms/{platform}   — one platform's connection status
 - POST /api/platforms/{platform}/configure — validate, persist, and apply platform config
@@ -1114,37 +1115,21 @@ class APIServerAdapter(BasePlatformAdapter):
         from run_agent import AIAgent
         from gateway.run import (
             _current_max_iterations,
-            _resolve_runtime_agent_kwargs,
-            _resolve_gateway_model,
-            _load_gateway_config,
             GatewayRunner,
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
-
-        # When the primary provider's auth fails (expired token / 429 quota
-        # cap), _resolve_runtime_agent_kwargs() falls through to the fallback
-        # provider chain, whose runtime dict carries its own ``model`` key.
-        # Pop it and let it override the config model, mirroring the native
-        # gateway path (_resolve_session_agent_runtime in run.py). Otherwise
-        # the explicit ``model=model`` below collides with the ``**runtime_kwargs``
-        # spread → "got multiple values for keyword argument 'model'", 500ing
-        # every /v1/chat/completions request while a fallback is active.
-        runtime_model = runtime_kwargs.pop("model", None)
-        if runtime_model:
-            model = runtime_model
-
-        user_config = _load_gateway_config()
+        runtime_policy = GatewayRunner._resolve_current_runtime_policy()
+        runtime_kwargs = runtime_policy["runtime_kwargs"]
+        reasoning_config = runtime_policy["reasoning_config"]
+        model = runtime_policy["model"]
+        user_config = runtime_policy["user_config"]
+        provider_routing = runtime_policy["provider_routing"]
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = _current_max_iterations()
 
-        # Load fallback provider chain so the API server platform has the
-        # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        fallback_model = GatewayRunner._load_fallback_model()
+        fallback_model = runtime_policy["fallback_model"]
 
         agent = AIAgent(
             model=model,
@@ -1163,6 +1148,14 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            providers_allowed=provider_routing.get("only"),
+            providers_ignored=provider_routing.get("ignore"),
+            providers_order=provider_routing.get("order"),
+            provider_sort=provider_routing.get("sort"),
+            provider_require_parameters=provider_routing.get(
+                "require_parameters", False
+            ),
+            provider_data_collection=provider_routing.get("data_collection"),
             gateway_session_key=gateway_session_key,
         )
         return agent
@@ -3873,6 +3866,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+
+    async def _smoke_model_policy(self) -> Dict[str, Any]:
+        """Run a minimal turn through the active model policy."""
+        result, usage = await self._run_agent(
+            user_message="Reply with OK to confirm the active model policy works.",
+            conversation_history=[],
+            ephemeral_system_prompt=(
+                "You are validating the active Hermes model policy. "
+                "Do not call tools. Reply with OK."
+            ),
+            session_id=f"api-model-policy-smoke-{uuid.uuid4().hex[:8]}",
+            gateway_session_key=None,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Model policy smoke returned an invalid result")
+        if result.get("failed") or result.get("partial"):
+            raise RuntimeError(str(result.get("error") or "Model policy smoke failed"))
+        if not str(result.get("final_response") or "").strip():
+            raise RuntimeError("Model policy smoke did not produce a response")
+        return {"ok": True, "usage": usage if isinstance(usage, dict) else {}}
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

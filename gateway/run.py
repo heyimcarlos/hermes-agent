@@ -2284,6 +2284,24 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _resolve_gateway_max_tokens(config: dict | None = None) -> Optional[int]:
+    """Read model.max_tokens from config.yaml for gateway-created agents."""
+    cfg = config if config is not None else _load_gateway_config()
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(model_cfg, dict):
+        return None
+
+    raw = model_cfg.get("max_tokens")
+    if raw is None or isinstance(raw, bool):
+        return None
+
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -3542,6 +3560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        runtime_policy: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -3556,7 +3575,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(user_config)
+        if runtime_policy is not None:
+            user_config = runtime_policy["user_config"]
+            model = runtime_policy["model"]
+        else:
+            model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -3567,6 +3590,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
             }
+            max_tokens = _resolve_gateway_max_tokens(user_config)
+            if max_tokens is not None:
+                override_runtime["max_tokens"] = max_tokens
             if override_runtime.get("api_key"):
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
@@ -3587,7 +3613,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if runtime_policy is not None and "runtime_kwargs" in runtime_policy:
+            runtime_kwargs = dict(runtime_policy["runtime_kwargs"])
+            max_tokens = runtime_policy.get("max_tokens")
+            if max_tokens is None:
+                max_tokens = _resolve_gateway_max_tokens(user_config)
+            if max_tokens is not None:
+                runtime_kwargs.setdefault("max_tokens", max_tokens)
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            max_tokens = _resolve_gateway_max_tokens(user_config)
+            if max_tokens is not None:
+                runtime_kwargs["max_tokens"] = max_tokens
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -3665,6 +3702,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        if runtime_kwargs.get("max_tokens") is not None:
+            runtime["max_tokens"] = runtime_kwargs.get("max_tokens")
         route = {
             "model": model,
             "runtime": runtime,
@@ -3675,6 +3714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                runtime.get("max_tokens"),
             ),
         }
 
@@ -4670,10 +4710,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
-                return cfg.get("provider_routing", {}) or {}
+                return GatewayRunner._provider_routing_from_config(cfg)
         except Exception:
             pass
         return {}
+
+    @staticmethod
+    def _provider_routing_from_config(config: dict) -> dict:
+        routing = config.get("provider_routing") if isinstance(config, dict) else {}
+        return routing if isinstance(routing, dict) else {}
 
     @staticmethod
     def _load_fallback_model() -> list | None:
@@ -4695,6 +4740,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _resolve_current_runtime_policy(
+        user_config: Optional[dict] = None,
+        *,
+        resolve_runtime: bool = True,
+    ) -> dict:
+        """Resolve the current model/runtime/fallback policy for a new agent.
+
+        Both HTTP API-server chat turns and native platform turns create
+        Gateway-owned AIAgent instances. Keep their runtime config resolution
+        shared so long-lived messaging adapters see the same provider/model
+        policy as fresh /chat requests.
+        """
+        resolved_config = user_config if user_config is not None else _load_gateway_config()
+        max_tokens = _resolve_gateway_max_tokens(resolved_config)
+        policy = {
+            "user_config": resolved_config,
+            "model": _resolve_gateway_model(resolved_config),
+            "fallback_model": GatewayRunner._load_fallback_model(),
+            "reasoning_config": GatewayRunner._load_reasoning_config(),
+            "max_tokens": max_tokens,
+            "provider_routing": GatewayRunner._provider_routing_from_config(
+                resolved_config
+            ),
+        }
+        if resolve_runtime:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if max_tokens is not None:
+                runtime_kwargs["max_tokens"] = max_tokens
+            policy["runtime_kwargs"] = runtime_kwargs
+        return policy
+
+    def _refresh_runtime_model_policy(self) -> dict:
+        """Reload model policy values that can change while Gateway is running."""
+        runtime_policy = self._resolve_current_runtime_policy(resolve_runtime=False)
+        self._fallback_model = runtime_policy["fallback_model"]
+        self._provider_routing = runtime_policy.get("provider_routing", {})
+        return runtime_policy
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {
@@ -16784,12 +16868,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             max_iterations = _current_max_iterations()
+            # Re-read .env and config for fresh credentials (gateway is long-lived,
+            # keys may change without restart). Keep config.yaml authoritative for
+            # runtime budget settings bridged into env vars.
+            _reload_runtime_env_preserving_config_authority()
+            runtime_policy = self._refresh_runtime_model_policy()
+            user_config = runtime_policy["user_config"]
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
-                    user_config=user_config,
+                    runtime_policy=runtime_policy,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
