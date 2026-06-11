@@ -24,6 +24,24 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
     """Return the capability fragment owned by these provider-control routes."""
     return {
         "features": {
+            "provider_api_key": {
+                "anthropic": {
+                    "connect": "/api/providers/anthropic/api-key",
+                    "disconnect": "/api/providers/anthropic",
+                },
+                "gemini": {
+                    "connect": "/api/providers/gemini/api-key",
+                    "disconnect": "/api/providers/gemini",
+                },
+                "openrouter": {
+                    "connect": "/api/providers/openrouter/api-key",
+                    "disconnect": "/api/providers/openrouter",
+                },
+                "xai": {
+                    "connect": "/api/providers/xai/api-key",
+                    "disconnect": "/api/providers/xai",
+                },
+            },
             "provider_oauth": {
                 "openai-codex": {
                     "flow": "device_code",
@@ -48,6 +66,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
             "provider_disconnect": {
                 "method": "DELETE",
                 "path": "/api/providers/{provider}",
+            },
+            "provider_api_key_connect": {
+                "method": "POST",
+                "path": "/api/providers/{provider}/api-key",
             },
             "model_policy": {"method": "GET", "path": "/api/model-policy"},
             "model_policy_validate": {
@@ -74,6 +96,22 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
                 "method": "DELETE",
                 "path": "/api/providers/openai-codex",
             },
+            "provider_api_key_openrouter_connect": {
+                "method": "POST",
+                "path": "/api/providers/openrouter/api-key",
+            },
+            "provider_api_key_anthropic_connect": {
+                "method": "POST",
+                "path": "/api/providers/anthropic/api-key",
+            },
+            "provider_api_key_gemini_connect": {
+                "method": "POST",
+                "path": "/api/providers/gemini/api-key",
+            },
+            "provider_api_key_xai_connect": {
+                "method": "POST",
+                "path": "/api/providers/xai/api-key",
+            },
         },
     }
 
@@ -96,6 +134,10 @@ def register_provider_control_routes(app: Any, adapter: Any) -> None:
     app.router.add_delete(
         "/api/providers/oauth/{provider_id}",
         _bind(adapter, _handle_provider_disconnect),
+    )
+    app.router.add_post(
+        "/api/providers/{provider_id}/api-key",
+        _bind(adapter, _handle_provider_api_key_connect),
     )
     app.router.add_get("/api/model-policy", _bind(adapter, _handle_model_policy))
     app.router.add_post(
@@ -386,6 +428,35 @@ async def _handle_provider_disconnect(adapter: Any, request: Any) -> Any:
         logger.exception("provider oauth disconnect failed for %s", provider_id)
         return _json_response(
             _openai_error(str(exc) or "Provider OAuth disconnect failed"),
+            status=500,
+        )
+
+
+async def _handle_provider_api_key_connect(adapter: Any, request: Any) -> Any:
+    auth_err = _check_auth(adapter, request)
+    if auth_err:
+        return auth_err
+
+    body = await _json_body(request)
+    if _is_response(body):
+        return body
+    if not isinstance(body, dict):
+        return _json_response(_openai_error("JSON object body is required"), status=400)
+
+    provider_id = request.match_info.get("provider_id", "")
+    api_key = body.get("api_key")
+    try:
+        from hermes_cli.provider_control import connect_provider_api_key
+
+        return _json_response(
+            await asyncio.to_thread(connect_provider_api_key, provider_id, api_key)
+        )
+    except ValueError as exc:
+        return _json_response(_openai_error(str(exc)), status=400)
+    except Exception as exc:
+        logger.exception("provider API-key connect failed for %s", provider_id)
+        return _json_response(
+            _openai_error(str(exc) or "Provider API-key connect failed"),
             status=500,
         )
 

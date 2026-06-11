@@ -8,7 +8,19 @@ from typing import Any, Dict, List, Optional
 
 
 CODEX_PROVIDER_ID = "openai-codex"
+ANTHROPIC_PROVIDER_ID = "anthropic"
+GEMINI_PROVIDER_ID = "gemini"
 OPENROUTER_PROVIDER_ID = "openrouter"
+XAI_PROVIDER_ID = "xai"
+ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+ANTHROPIC_TOKEN_ENV = "ANTHROPIC_TOKEN"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+XAI_API_KEY_ENV = "XAI_API_KEY"
+TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV = "TRYAGENT_MANAGED_OPENROUTER_API_KEY"
+TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV = "TRYAGENT_OPENROUTER_CONNECTION_KIND"
+TRYAGENT_USER_OPENROUTER_CONNECTION_KIND = "user_api_key"
 
 
 def list_providers() -> Dict[str, Any]:
@@ -17,19 +29,127 @@ def list_providers() -> Dict[str, Any]:
     return {
         "providers": [
             _provider_status(CODEX_PROVIDER_ID, policy),
+            _provider_status(ANTHROPIC_PROVIDER_ID, policy),
+            _provider_status(GEMINI_PROVIDER_ID, policy),
             _provider_status(OPENROUTER_PROVIDER_ID, policy),
+            _provider_status(XAI_PROVIDER_ID, policy),
         ]
+    }
+
+
+def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
+    """Persist an API-key provider credential without exposing it in responses."""
+    provider = _normalize_provider(provider_id)
+    if provider not in {
+        ANTHROPIC_PROVIDER_ID,
+        GEMINI_PROVIDER_ID,
+        OPENROUTER_PROVIDER_ID,
+        XAI_PROVIDER_ID,
+    }:
+        raise ValueError(f"Unsupported API-key provider connect: {provider_id}")
+
+    if not isinstance(api_key, str):
+        raise ValueError("api_key is required")
+
+    key = api_key.strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    if not key:
+        raise ValueError("api_key is required")
+
+    if provider == ANTHROPIC_PROVIDER_ID:
+        _save_anthropic_api_key(key)
+    elif provider == GEMINI_PROVIDER_ID:
+        _remove_env_value(GOOGLE_API_KEY_ENV)
+        _save_env_value(GEMINI_API_KEY_ENV, key)
+    elif provider == XAI_PROVIDER_ID:
+        _save_env_value(XAI_API_KEY_ENV, key)
+    else:
+        current_key = _openrouter_api_key()
+        current_kind = _openrouter_connection_kind()
+        if current_key and current_kind != TRYAGENT_USER_OPENROUTER_CONNECTION_KIND:
+            _save_env_value(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV, current_key)
+
+        _save_env_value(OPENROUTER_API_KEY_ENV, key)
+        _save_env_value(
+            TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV,
+            TRYAGENT_USER_OPENROUTER_CONNECTION_KIND,
+        )
+
+    policy = get_model_policy()
+    return {
+        "ok": True,
+        "connected": True,
+        "provider": provider,
+        "connection_kind": "api_key",
+        "credential_fingerprint": _secret_fingerprint(key),
+        "active_policy": _policy_mentions_provider(policy, provider),
+        "restart_required": False,
     }
 
 
 def disconnect_provider(provider_id: str) -> Dict[str, Any]:
     """Clear provider credentials without mutating the active model policy."""
     provider = _normalize_provider(provider_id)
-    if provider != CODEX_PROVIDER_ID:
+    if provider not in {
+        ANTHROPIC_PROVIDER_ID,
+        CODEX_PROVIDER_ID,
+        GEMINI_PROVIDER_ID,
+        OPENROUTER_PROVIDER_ID,
+        XAI_PROVIDER_ID,
+    }:
         raise ValueError(f"Unsupported provider disconnect: {provider_id}")
 
     policy = get_model_policy()
     active_policy_affected = _policy_mentions_provider(policy, provider)
+
+    if provider == OPENROUTER_PROVIDER_ID:
+        managed_key = _managed_openrouter_api_key()
+        if managed_key:
+            _save_env_value(OPENROUTER_API_KEY_ENV, managed_key)
+        else:
+            _remove_env_value(OPENROUTER_API_KEY_ENV)
+        _remove_env_value(TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV)
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
+            "managed_credential_restored": bool(managed_key),
+        }
+
+    if provider == ANTHROPIC_PROVIDER_ID:
+        credential_removed = _remove_env_value(ANTHROPIC_API_KEY_ENV)
+        credential_removed = _remove_env_value(ANTHROPIC_TOKEN_ENV) or credential_removed
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": credential_removed,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
+        }
+
+    if provider == GEMINI_PROVIDER_ID:
+        credential_removed = _remove_env_value(GEMINI_API_KEY_ENV)
+        credential_removed = _remove_env_value(GOOGLE_API_KEY_ENV) or credential_removed
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": credential_removed,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
+        }
+
+    if provider == XAI_PROVIDER_ID:
+        credential_removed = _remove_env_value(XAI_API_KEY_ENV)
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": credential_removed,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
+        }
 
     from hermes_cli.provider_oauth import disconnect_codex
 
@@ -172,8 +292,14 @@ def restore_model_policy_config(config: Dict[str, Any]) -> Dict[str, Any]:
 def _provider_status(provider: str, policy: Dict[str, Any]) -> Dict[str, Any]:
     if provider == CODEX_PROVIDER_ID:
         return _codex_status(policy)
+    if provider == ANTHROPIC_PROVIDER_ID:
+        return _anthropic_status(policy)
+    if provider == GEMINI_PROVIDER_ID:
+        return _gemini_status(policy)
     if provider == OPENROUTER_PROVIDER_ID:
         return _openrouter_status(policy)
+    if provider == XAI_PROVIDER_ID:
+        return _xai_status(policy)
     raise ValueError(f"Unsupported provider: {provider}")
 
 
@@ -202,6 +328,40 @@ def _codex_status(policy: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _anthropic_status(policy: Dict[str, Any]) -> Dict[str, Any]:
+    token = _anthropic_api_key()
+    connected = bool(token)
+    return {
+        "id": ANTHROPIC_PROVIDER_ID,
+        "name": "Anthropic",
+        "connection_kind": "api_key",
+        "status": "connected" if connected else "disconnected",
+        "connected": connected,
+        "credential_fingerprint": _secret_fingerprint(token),
+        "last_error_message": None,
+        "active_policy": _policy_mentions_provider(policy, ANTHROPIC_PROVIDER_ID),
+        "oauth": None,
+        "model_policy": True,
+    }
+
+
+def _gemini_status(policy: Dict[str, Any]) -> Dict[str, Any]:
+    token = _gemini_api_key()
+    connected = bool(token)
+    return {
+        "id": GEMINI_PROVIDER_ID,
+        "name": "Gemini",
+        "connection_kind": "api_key",
+        "status": "connected" if connected else "disconnected",
+        "connected": connected,
+        "credential_fingerprint": _secret_fingerprint(token),
+        "last_error_message": None,
+        "active_policy": _policy_mentions_provider(policy, GEMINI_PROVIDER_ID),
+        "oauth": None,
+        "model_policy": True,
+    }
+
+
 def _openrouter_status(policy: Dict[str, Any]) -> Dict[str, Any]:
     token = _openrouter_api_key()
     connected = bool(token)
@@ -219,16 +379,113 @@ def _openrouter_status(policy: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _xai_status(policy: Dict[str, Any]) -> Dict[str, Any]:
+    token = _xai_api_key()
+    connected = bool(token)
+    return {
+        "id": XAI_PROVIDER_ID,
+        "name": "xAI",
+        "connection_kind": "api_key",
+        "status": "connected" if connected else "disconnected",
+        "connected": connected,
+        "credential_fingerprint": _secret_fingerprint(token),
+        "last_error_message": None,
+        "active_policy": _policy_mentions_provider(policy, XAI_PROVIDER_ID),
+        "oauth": None,
+        "model_policy": True,
+    }
+
+
 def _openrouter_api_key() -> str:
     try:
         from hermes_cli.config import get_env_value
 
-        value = get_env_value("OPENROUTER_API_KEY")
+        value = get_env_value(OPENROUTER_API_KEY_ENV)
         if value:
             return str(value)
     except Exception:
         pass
-    return os.getenv("OPENROUTER_API_KEY", "")
+    return os.getenv(OPENROUTER_API_KEY_ENV, "")
+
+
+def _anthropic_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        for key in (ANTHROPIC_API_KEY_ENV, ANTHROPIC_TOKEN_ENV):
+            value = get_env_value(key)
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return os.getenv(ANTHROPIC_API_KEY_ENV, "") or os.getenv(ANTHROPIC_TOKEN_ENV, "")
+
+
+def _gemini_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        for key in (GEMINI_API_KEY_ENV, GOOGLE_API_KEY_ENV):
+            value = get_env_value(key)
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return os.getenv(GEMINI_API_KEY_ENV, "") or os.getenv(GOOGLE_API_KEY_ENV, "")
+
+
+def _xai_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(XAI_API_KEY_ENV)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(XAI_API_KEY_ENV, "")
+
+
+def _save_anthropic_api_key(value: str) -> None:
+    from hermes_cli.config import save_anthropic_api_key
+
+    save_anthropic_api_key(value)
+
+
+def _managed_openrouter_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV, "")
+
+
+def _openrouter_connection_kind() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV, "")
+
+
+def _save_env_value(key: str, value: str) -> None:
+    from hermes_cli.config import save_env_value
+
+    save_env_value(key, value)
+
+
+def _remove_env_value(key: str) -> bool:
+    from hermes_cli.config import remove_env_value
+
+    return bool(remove_env_value(key))
 
 
 def _read_raw_config() -> Dict[str, Any]:
