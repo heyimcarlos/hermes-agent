@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from gateway.platforms.api_server_platform_control import register_platform_cont
 
 
 VALID_TELEGRAM_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd12345"
+VALID_DISCORD_TOKEN = "MTAxMDExMDExMDExMDExMDEx.Mabcde.valid-discord-token"
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +29,14 @@ def isolated_hermes_home(tmp_path, monkeypatch):
         "TELEGRAM_HOME_CHANNEL",
         "TELEGRAM_HOME_CHANNEL_NAME",
         "TELEGRAM_HOME_CHANNEL_THREAD_ID",
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_ALLOWED_USERS",
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_REQUIRE_MENTION",
+        "DISCORD_HOME_CHANNEL",
+        "DISCORD_HOME_CHANNEL_NAME",
+        "DISCORD_HOME_CHANNEL_THREAD_ID",
     ):
         monkeypatch.delenv(key, raising=False)
     return hermes_home
@@ -48,6 +58,18 @@ def _telegram_payload() -> dict:
         "bot_token": VALID_TELEGRAM_TOKEN,
         "allowed_users": ["1001", "1002"],
         "home_channel": {"chat_id": "1001", "name": "Owner DM"},
+    }
+
+
+def _discord_payload() -> dict:
+    return {
+        "bot_token": VALID_DISCORD_TOKEN,
+        "allowed_users": ["119991111111111111"],
+        "home_channel": {
+            "chat_id": "229992222222222222",
+            "name": "#agent",
+            "thread_id": "339993333333333333",
+        },
     }
 
 
@@ -215,6 +237,125 @@ async def test_configure_telegram_reconnects_only_telegram_adapter():
 
 
 @pytest.mark.asyncio
+async def test_configure_discord_hot_applies_and_enables_toolsets(isolated_hermes_home):
+    from hermes_cli.tools_config import _get_platform_tools
+
+    adapter = _make_adapter()
+    runner = FakeGatewayRunner()
+    adapter.gateway_runner = runner
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/platforms/discord/configure",
+            headers={"Authorization": "Bearer sk-secret"},
+            json=_discord_payload(),
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["ok"] is True
+    assert data["platform"] == "discord"
+    assert data["applied"] is True
+    assert data["restart_required"] is False
+    assert data["state"] == "connected"
+    assert data["status"]["id"] == "discord"
+    assert data["status"]["state"] == "connected"
+    assert data["status"]["allowed_users"] == ["119991111111111111"]
+    assert data["status"]["home_channel"]["chat_id"] == "229992222222222222"
+    assert VALID_DISCORD_TOKEN not in str(data)
+
+    state_path = (
+        isolated_hermes_home / "gateway" / "platform-control" / "discord.json"
+    )
+    state_text = state_path.read_text(encoding="utf-8")
+    assert VALID_DISCORD_TOKEN in state_text
+    assert "229992222222222222" in state_text
+
+    created_config = runner.created_configs[0][1]
+    assert runner.created_configs[0][0] == Platform.DISCORD
+    assert created_config.extra["allow_from"] == ["119991111111111111"]
+    assert created_config.extra["allowed_channels"] == ["229992222222222222"]
+    assert created_config.extra["free_response_channels"] == ["229992222222222222"]
+    assert created_config.extra["require_mention"] is True
+    assert created_config.home_channel.chat_id == "229992222222222222"
+    assert created_config.home_channel.thread_id == "339993333333333333"
+    assert created_config.token == VALID_DISCORD_TOKEN
+    assert runner.delivery_router.adapters is runner.adapters
+
+    enabled_toolsets = _get_platform_tools({}, "discord")
+    assert "discord" in enabled_toolsets
+    assert "discord_admin" in enabled_toolsets
+
+
+@pytest.mark.asyncio
+async def test_configure_discord_owner_dm_does_not_require_home_channel():
+    adapter = _make_adapter()
+    runner = FakeGatewayRunner()
+    adapter.gateway_runner = runner
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/platforms/discord/configure",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={
+                "bot_token": VALID_DISCORD_TOKEN,
+                "allowed_users": ["<@119991111111111111>"],
+            },
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["status"]["allowed_users"] == ["119991111111111111"]
+    assert data["status"]["home_channel"] is None
+    created_config = runner.created_configs[0][1]
+    assert created_config.home_channel is None
+    assert created_config.extra["allowed_channels"] == []
+    assert created_config.extra["free_response_channels"] == []
+
+
+@pytest.mark.asyncio
+async def test_configure_discord_owner_dm_reconfigure_clears_server_channel_state():
+    adapter = _make_adapter()
+    runner = FakeGatewayRunner()
+    adapter.gateway_runner = runner
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        first = await cli.post(
+            "/api/platforms/discord/configure",
+            headers={"Authorization": "Bearer sk-secret"},
+            json=_discord_payload(),
+        )
+        await first.json()
+
+        second = await cli.post(
+            "/api/platforms/discord/configure",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={
+                "bot_token": VALID_DISCORD_TOKEN,
+                "allowed_users": ["119991111111111111"],
+            },
+        )
+        data = await second.json()
+
+    assert first.status == 200
+    assert second.status == 200
+    assert data["status"]["home_channel"] is None
+    assert os.getenv("DISCORD_HOME_CHANNEL") is None
+    assert os.getenv("DISCORD_HOME_CHANNEL_NAME") is None
+    assert os.getenv("DISCORD_HOME_CHANNEL_THREAD_ID") is None
+    assert os.getenv("DISCORD_ALLOWED_CHANNELS") is None
+    assert os.getenv("DISCORD_FREE_RESPONSE_CHANNELS") is None
+
+    created_config = runner.created_configs[-1][1]
+    assert created_config.home_channel is None
+    assert created_config.extra["allowed_channels"] == []
+    assert created_config.extra["free_response_channels"] == []
+
+
+@pytest.mark.asyncio
 async def test_configure_telegram_requires_auth():
     adapter = _make_adapter()
     app = _create_app(adapter)
@@ -258,7 +399,7 @@ async def test_unsupported_platform_returns_typed_response():
 
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
-            "/api/platforms/discord/configure",
+            "/api/platforms/whatsapp/configure",
             headers={"Authorization": "Bearer sk-secret"},
             json={},
         )
@@ -266,7 +407,7 @@ async def test_unsupported_platform_returns_typed_response():
 
     assert resp.status == 400
     assert data["ok"] is False
-    assert data["platform"] == "discord"
+    assert data["platform"] == "whatsapp"
     assert data["supported"] is False
     assert data["error_code"] == "unsupported_platform"
 
@@ -404,3 +545,16 @@ async def test_runtime_platform_state_loads_into_gateway_config():
     assert telegram.token == VALID_TELEGRAM_TOKEN
     assert telegram.extra["allow_from"] == ["1001", "1002"]
     assert telegram.home_channel.chat_id == "1001"
+
+    discord_result = await configure_platform("discord", _discord_payload(), runner=None)
+    assert discord_result["restart_required"] is True
+
+    config = load_gateway_config()
+    discord = config.platforms[Platform.DISCORD]
+    assert discord.enabled is True
+    assert discord.token == VALID_DISCORD_TOKEN
+    assert discord.extra["allow_from"] == ["119991111111111111"]
+    assert discord.extra["allowed_channels"] == ["229992222222222222"]
+    assert discord.extra["free_response_channels"] == ["229992222222222222"]
+    assert discord.extra["require_mention"] is True
+    assert discord.home_channel.chat_id == "229992222222222222"
