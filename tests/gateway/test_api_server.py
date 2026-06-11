@@ -38,6 +38,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from gateway.platforms.api_server_provider_control import register_provider_control_routes
+from gateway.platforms.api_server_platform_control import register_platform_control_routes
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +617,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     register_provider_control_routes(app, adapter)
+    register_platform_control_routes(app, adapter)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -889,10 +891,22 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["provider_oauth"]["openai-codex"]["flow"] == "device_code"
+            assert data["features"]["provider_status"] is True
+            assert data["features"]["model_policy"] is True
+            assert data["features"]["platform_control"] is True
+            assert data["features"]["platforms"]["telegram"]["configure"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["providers"]["path"] == "/api/providers"
+            assert data["endpoints"]["model_policy_apply"]["path"] == "/api/model-policy/apply"
+            assert data["endpoints"]["platform_configure"]["path"] == "/api/platforms/{platform}/configure"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert (
+                data["endpoints"]["provider_oauth_codex_start"]["path"]
+                == "/api/providers/oauth/openai-codex/start"
+            )
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):

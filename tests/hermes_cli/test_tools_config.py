@@ -1281,13 +1281,20 @@ def test_get_platform_tools_second_pass_skips_fully_claimed_toolsets():
     assert "search" not in enabled
 
 
-def test_get_platform_tools_discord_both_off_by_default():
-    """Both `discord` and `discord_admin` are opt-in via `hermes tools`,
-    even on the Discord platform itself.  Users shouldn't auto-inherit 19
-    extra tools just because DISCORD_BOT_TOKEN is set."""
+def test_get_platform_tools_discord_both_off_without_token(monkeypatch):
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+
     enabled = _get_platform_tools({}, "discord")
     assert "discord" not in enabled
     assert "discord_admin" not in enabled
+
+
+def test_get_platform_tools_discord_both_on_with_token(monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "configured-token")
+
+    enabled = _get_platform_tools({}, "discord")
+    assert "discord" in enabled
+    assert "discord_admin" in enabled
 
 
 def test_discord_toolsets_in_configurable_toolsets():
@@ -1596,7 +1603,6 @@ def test_real_configurable_changes_still_reported_in_diff():
     # User adds 'vision' (configurable) — must still report as added.
     new_enabled2 = (current - {"kanban"}) | {"vision"}
     assert ((new_enabled2 - current) & universe) == {"vision"}
-
 
 def test_vision_picker_writes_provider_and_model(tmp_path, monkeypatch):
     """Picking a provider+model persists auxiliary.vision.{provider,model}.

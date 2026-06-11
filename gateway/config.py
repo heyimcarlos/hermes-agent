@@ -1167,6 +1167,35 @@ def load_gateway_config() -> GatewayConfig:
             e,
         )
 
+    try:
+        from hermes_cli.platform_control import (
+            apply_runtime_platform_env_overrides,
+            runtime_platform_config_overrides,
+        )
+
+        platform_overrides = runtime_platform_config_overrides()
+        if platform_overrides:
+            platforms_data = gw_data.setdefault("platforms", {})
+            if not isinstance(platforms_data, dict):
+                platforms_data = {}
+                gw_data["platforms"] = platforms_data
+            for platform_name, override in platform_overrides.items():
+                existing = platforms_data.get(platform_name, {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing_extra = existing.get("extra", {})
+                override_extra = override.get("extra", {})
+                merged = {**existing, **override}
+                if isinstance(existing_extra, dict) or isinstance(override_extra, dict):
+                    merged["extra"] = {
+                        **(existing_extra if isinstance(existing_extra, dict) else {}),
+                        **(override_extra if isinstance(override_extra, dict) else {}),
+                    }
+                platforms_data[platform_name] = merged
+        apply_runtime_platform_env_overrides(overwrite=False)
+    except Exception as e:
+        logger.warning("Failed to load platform-control runtime state: %s", e)
+
     config = GatewayConfig.from_dict(gw_data)
 
     # Override with environment variables

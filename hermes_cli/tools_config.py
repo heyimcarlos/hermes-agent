@@ -143,6 +143,12 @@ def _xai_credentials_present() -> bool:
         pass
     return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
 
+
+def _discord_credentials_present() -> bool:
+    """Cheap check used to enable Discord-native tools for configured bots."""
+    return bool(str(os.environ.get("DISCORD_BOT_TOKEN") or "").strip())
+
+
 # Platform-scoped toolsets: only appear in the `hermes tools` checklist for
 # these platforms, and only resolve/save for these platforms.  A toolset
 # absent from this map is available on every platform (current behaviour).
@@ -1515,6 +1521,14 @@ def _get_platform_tools(
         if x_search_auto_enabled:
             enabled_toolsets.add("x_search")
 
+        discord_auto_enabled = (
+            platform == "discord"
+            and _discord_credentials_present()
+            and _toolset_allowed_for_platform("discord", platform)
+        )
+        if discord_auto_enabled:
+            enabled_toolsets.update({"discord", "discord_admin"})
+
         default_off = set(_DEFAULT_OFF_TOOLSETS)
         # Legacy safety: if the platform's own name matches a default-off
         # toolset (e.g. `homeassistant` platform + `homeassistant` toolset),
@@ -1537,6 +1551,9 @@ def _get_platform_tools(
         # strip the entry we just added.
         if x_search_auto_enabled and "x_search" in default_off:
             default_off.remove("x_search")
+        if discord_auto_enabled:
+            default_off.discard("discord")
+            default_off.discard("discord_admin")
         enabled_toolsets -= default_off
 
     # Recover non-configurable platform toolsets (e.g. discord, feishu_doc,

@@ -14,6 +14,16 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
+- GET  /api/providers              — provider connection status
+- POST /api/providers/oauth/{provider}/start — start provider OAuth flow
+- GET  /api/providers/oauth/{provider}/poll/{session_id} — poll provider OAuth flow
+- DELETE /api/providers/{provider} — disconnect provider credentials
+- GET  /api/model-policy           — active provider/model/fallback policy
+- POST /api/model-policy/validate  — validate provider/model/fallback policy
+- POST /api/model-policy/apply     — persist provider/model/fallback policy
+- GET  /api/platforms              — platform connection status
+- GET  /api/platforms/{platform}   — one platform's connection status
+- POST /api/platforms/{platform}/configure — validate, persist, and apply platform config
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
@@ -63,6 +73,8 @@ from gateway.platforms.api_server_provider_control import (
     provider_control_capabilities,
     register_provider_control_routes,
 )
+from gateway.platforms.api_server_platform_control import register_platform_control_routes
+from hermes_cli.platform_control import platform_control_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -814,6 +826,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via _run_streams).
         self._inflight_agent_runs: int = 0
+        self.gateway_runner: Optional[Any] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1242,6 +1255,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         provider_control = provider_control_capabilities()
+        platform_control = platform_control_capabilities()
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1273,6 +1287,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 **provider_control["features"],
+                **platform_control["features"],
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
@@ -1299,6 +1314,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 **provider_control["endpoints"],
+                **platform_control["endpoints"],
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4531,6 +4547,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             register_provider_control_routes(self._app, self)
+            register_platform_control_routes(self._app, self)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
