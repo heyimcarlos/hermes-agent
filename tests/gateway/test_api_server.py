@@ -680,6 +680,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["provider_api_key"]["openrouter"]["connect"] == "/api/providers/openrouter/api-key"
             assert data["features"]["provider_oauth"]["openai-codex"]["flow"] == "device_code"
             assert data["features"]["provider_status"] is True
             assert data["features"]["model_policy"] is True
@@ -688,6 +689,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["providers"]["path"] == "/api/providers"
+            assert data["endpoints"]["provider_api_key_connect"]["path"] == "/api/providers/{provider}/api-key"
             assert data["endpoints"]["model_policy_apply"]["path"] == "/api/model-policy/apply"
             assert data["endpoints"]["model_policy_activate"]["path"] == "/api/model-policy/activate"
             assert data["endpoints"]["platform_configure"]["path"] == "/api/platforms/{platform}/configure"
@@ -829,6 +831,97 @@ class TestProviderOAuthEndpoint:
             assert data["disconnected"] is True
 
     @pytest.mark.asyncio
+    async def test_openrouter_api_key_connect_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/openrouter/api-key",
+                json={"api_key": "sk-or-user-secret"},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_openrouter_api_key_connect_rejects_non_string_key(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/openrouter/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": {"secret": "sk-or-user-secret"}},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["message"] == "api_key is required"
+
+    @pytest.mark.asyncio
+    async def test_openrouter_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        remove_env_value("OPENROUTER_API_KEY")
+        remove_env_value("TRYAGENT_MANAGED_OPENROUTER_API_KEY")
+        remove_env_value("TRYAGENT_OPENROUTER_CONNECTION_KIND")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/openrouter/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "Bearer sk-or-user-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "openrouter"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "sk-or-user-secret" not in str(data)
+        env = load_env()
+        assert env["OPENROUTER_API_KEY"] == "sk-or-user-secret"
+        assert env["TRYAGENT_OPENROUTER_CONNECTION_KIND"] == "user_api_key"
+
+    @pytest.mark.asyncio
+    async def test_openrouter_disconnect_restores_managed_key(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        remove_env_value("TRYAGENT_MANAGED_OPENROUTER_API_KEY")
+        remove_env_value("TRYAGENT_OPENROUTER_CONNECTION_KIND")
+        save_env_value("OPENROUTER_API_KEY", "managed-openrouter-secret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            connect = await cli.post(
+                "/api/providers/openrouter/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "sk-or-user-secret"},
+            )
+            assert connect.status == 200
+
+            disconnect = await cli.delete(
+                "/api/providers/openrouter",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "openrouter",
+            "active_policy_affected": False,
+            "managed_credential_restored": True,
+        }
+        assert "sk-or-user-secret" not in str(data)
+        assert "managed-openrouter-secret" not in str(data)
+        env = load_env()
+        assert env["OPENROUTER_API_KEY"] == "managed-openrouter-secret"
+        assert env["TRYAGENT_MANAGED_OPENROUTER_API_KEY"] == "managed-openrouter-secret"
+        assert "TRYAGENT_OPENROUTER_CONNECTION_KIND" not in env
+
+    @pytest.mark.asyncio
     async def test_unsupported_provider_returns_400(self, auth_adapter):
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -847,6 +940,7 @@ class TestProviderOAuthEndpoint:
                 "/api/providers/oauth/openai-codex/poll/session-1",
                 "/api/providers/openai-codex",
                 "/api/providers/oauth/openai-codex",
+                "/api/providers/openrouter/api-key",
             ):
                 resp = await cli.options(path)
                 assert resp.status in {200, 204, 403, 405}
