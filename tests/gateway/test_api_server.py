@@ -909,6 +909,15 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            provider_api_key = data["features"]["provider_api_key"]
+            assert provider_api_key["anthropic"]["connect"] == "/api/providers/anthropic/api-key"
+            assert provider_api_key["anthropic"]["disconnect"] == "/api/providers/anthropic"
+            assert provider_api_key["gemini"]["connect"] == "/api/providers/gemini/api-key"
+            assert provider_api_key["gemini"]["disconnect"] == "/api/providers/gemini"
+            assert provider_api_key["openrouter"]["connect"] == "/api/providers/openrouter/api-key"
+            assert provider_api_key["openrouter"]["disconnect"] == "/api/providers/openrouter"
+            assert provider_api_key["xai"]["connect"] == "/api/providers/xai/api-key"
+            assert provider_api_key["xai"]["disconnect"] == "/api/providers/xai"
             assert data["features"]["provider_oauth"]["openai-codex"]["flow"] == "device_code"
             assert data["features"]["provider_status"] is True
             assert data["features"]["model_policy"] is True
@@ -917,6 +926,10 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["providers"]["path"] == "/api/providers"
+            assert data["endpoints"]["provider_api_key_connect"]["path"] == "/api/providers/{provider}/api-key"
+            assert data["endpoints"]["provider_api_key_anthropic_connect"]["path"] == "/api/providers/anthropic/api-key"
+            assert data["endpoints"]["provider_api_key_gemini_connect"]["path"] == "/api/providers/gemini/api-key"
+            assert data["endpoints"]["provider_api_key_xai_connect"]["path"] == "/api/providers/xai/api-key"
             assert data["endpoints"]["model_policy_apply"]["path"] == "/api/model-policy/apply"
             assert data["endpoints"]["model_policy_activate"]["path"] == "/api/model-policy/activate"
             assert data["endpoints"]["platform_configure"]["path"] == "/api/platforms/{platform}/configure"
@@ -1058,6 +1071,274 @@ class TestProviderOAuthEndpoint:
             assert data["disconnected"] is True
 
     @pytest.mark.asyncio
+    async def test_openrouter_api_key_connect_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/openrouter/api-key",
+                json={"api_key": "sk-or-user-secret"},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_openrouter_api_key_connect_rejects_non_string_key(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/openrouter/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": {"secret": "sk-or-user-secret"}},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["message"] == "api_key is required"
+
+    @pytest.mark.asyncio
+    async def test_anthropic_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        remove_env_value("ANTHROPIC_API_KEY")
+        remove_env_value("ANTHROPIC_TOKEN")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/anthropic/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "sk-ant-api03-user-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "anthropic"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "sk-ant-api03-user-secret" not in str(data)
+        env = load_env()
+        assert env["ANTHROPIC_API_KEY"] == "sk-ant-api03-user-secret"
+        assert env.get("ANTHROPIC_TOKEN", "") == ""
+
+    @pytest.mark.asyncio
+    async def test_gemini_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        remove_env_value("GEMINI_API_KEY")
+        remove_env_value("GOOGLE_API_KEY")
+        save_env_value("GOOGLE_API_KEY", "AIzaSyLegacyGoogleSecret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/gemini/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "AIzaSyGeminiUserSecret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "gemini"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "AIzaSyGeminiUserSecret" not in str(data)
+        assert "AIzaSyLegacyGoogleSecret" not in str(data)
+        env = load_env()
+        assert env["GEMINI_API_KEY"] == "AIzaSyGeminiUserSecret"
+        assert env.get("GOOGLE_API_KEY", "") == ""
+
+    @pytest.mark.asyncio
+    async def test_xai_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        remove_env_value("XAI_API_KEY")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/xai/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "xai-user-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "xai"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "xai-user-secret" not in str(data)
+        env = load_env()
+        assert env["XAI_API_KEY"] == "xai-user-secret"
+
+    @pytest.mark.asyncio
+    async def test_anthropic_disconnect_clears_runtime_key(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        save_env_value("ANTHROPIC_API_KEY", "sk-ant-api03-user-secret")
+        save_env_value("ANTHROPIC_TOKEN", "legacy-token-secret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            disconnect = await cli.delete(
+                "/api/providers/anthropic",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "anthropic",
+            "active_policy_affected": False,
+        }
+        assert "sk-ant-api03-user-secret" not in str(data)
+        assert "legacy-token-secret" not in str(data)
+        env = load_env()
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "ANTHROPIC_TOKEN" not in env
+        remove_env_value("ANTHROPIC_API_KEY")
+        remove_env_value("ANTHROPIC_TOKEN")
+
+    @pytest.mark.asyncio
+    async def test_gemini_disconnect_clears_runtime_key_aliases(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        save_env_value("GEMINI_API_KEY", "AIzaSyGeminiUserSecret")
+        save_env_value("GOOGLE_API_KEY", "AIzaSyLegacyGoogleSecret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            disconnect = await cli.delete(
+                "/api/providers/gemini",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "gemini",
+            "active_policy_affected": False,
+        }
+        assert "AIzaSyGeminiUserSecret" not in str(data)
+        assert "AIzaSyLegacyGoogleSecret" not in str(data)
+        env = load_env()
+        assert "GEMINI_API_KEY" not in env
+        assert "GOOGLE_API_KEY" not in env
+        remove_env_value("GEMINI_API_KEY")
+        remove_env_value("GOOGLE_API_KEY")
+
+    @pytest.mark.asyncio
+    async def test_xai_disconnect_clears_runtime_key(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        save_env_value("XAI_API_KEY", "xai-user-secret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            disconnect = await cli.delete(
+                "/api/providers/xai",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "xai",
+            "active_policy_affected": False,
+        }
+        assert "xai-user-secret" not in str(data)
+        env = load_env()
+        assert "XAI_API_KEY" not in env
+        remove_env_value("XAI_API_KEY")
+
+    @pytest.mark.asyncio
+    async def test_openrouter_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        remove_env_value("OPENROUTER_API_KEY")
+        remove_env_value("TRYAGENT_MANAGED_OPENROUTER_API_KEY")
+        remove_env_value("TRYAGENT_OPENROUTER_CONNECTION_KIND")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/openrouter/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "Bearer sk-or-user-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "openrouter"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "sk-or-user-secret" not in str(data)
+        env = load_env()
+        assert env["OPENROUTER_API_KEY"] == "sk-or-user-secret"
+        assert env["TRYAGENT_OPENROUTER_CONNECTION_KIND"] == "user_api_key"
+
+    @pytest.mark.asyncio
+    async def test_openrouter_disconnect_restores_managed_key(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        remove_env_value("TRYAGENT_MANAGED_OPENROUTER_API_KEY")
+        remove_env_value("TRYAGENT_OPENROUTER_CONNECTION_KIND")
+        save_env_value("OPENROUTER_API_KEY", "managed-openrouter-secret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            connect = await cli.post(
+                "/api/providers/openrouter/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "sk-or-user-secret"},
+            )
+            assert connect.status == 200
+
+            disconnect = await cli.delete(
+                "/api/providers/openrouter",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "openrouter",
+            "active_policy_affected": False,
+            "managed_credential_restored": True,
+        }
+        assert "sk-or-user-secret" not in str(data)
+        assert "managed-openrouter-secret" not in str(data)
+        env = load_env()
+        assert env["OPENROUTER_API_KEY"] == "managed-openrouter-secret"
+        assert env["TRYAGENT_MANAGED_OPENROUTER_API_KEY"] == "managed-openrouter-secret"
+        assert "TRYAGENT_OPENROUTER_CONNECTION_KIND" not in env
+
+    @pytest.mark.asyncio
     async def test_unsupported_provider_returns_400(self, auth_adapter):
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1076,6 +1357,12 @@ class TestProviderOAuthEndpoint:
                 "/api/providers/oauth/openai-codex/poll/session-1",
                 "/api/providers/openai-codex",
                 "/api/providers/oauth/openai-codex",
+                "/api/providers/anthropic/api-key",
+                "/api/providers/openrouter/api-key",
+                "/api/providers/gemini/api-key",
+                "/api/providers/gemini",
+                "/api/providers/xai/api-key",
+                "/api/providers/xai",
             ):
                 resp = await cli.options(path)
                 assert resp.status in {200, 204, 403, 405}
@@ -1089,7 +1376,9 @@ class TestProviderOAuthEndpoint:
 class TestProviderControlEndpoints:
     @pytest.mark.asyncio
     async def test_list_providers_returns_non_secret_status(self, auth_adapter, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
         monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+        monkeypatch.setenv("XAI_API_KEY", "xai-secret")
         monkeypatch.setattr(
             "hermes_cli.auth.get_codex_auth_status",
             lambda: {
@@ -1112,9 +1401,14 @@ class TestProviderControlEndpoints:
         assert providers["openai-codex"]["status"] == "connected"
         assert providers["openai-codex"]["oauth"]["flow"] == "device_code"
         assert providers["openai-codex"]["credential_fingerprint"].startswith("sha256:")
+        assert providers["gemini"]["status"] == "connected"
         assert providers["openrouter"]["status"] == "connected"
+        assert providers["xai"]["status"] == "connected"
+        assert providers["xai"]["credential_fingerprint"].startswith("sha256:")
         assert "codex-secret-token" not in str(data)
+        assert "gemini-secret" not in str(data)
         assert "openrouter-secret" not in str(data)
+        assert "xai-secret" not in str(data)
 
     @pytest.mark.asyncio
     async def test_model_policy_reads_primary_and_fallbacks(self, auth_adapter):
