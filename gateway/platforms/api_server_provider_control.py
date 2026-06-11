@@ -37,6 +37,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
                     "connect": "/api/providers/openrouter/api-key",
                     "disconnect": "/api/providers/openrouter",
                 },
+                "xai": {
+                    "connect": "/api/providers/xai/api-key",
+                    "disconnect": "/api/providers/xai",
+                },
             },
             "provider_oauth": {
                 "openai-codex": {
@@ -103,6 +107,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
             "provider_api_key_gemini_connect": {
                 "method": "POST",
                 "path": "/api/providers/gemini/api-key",
+            },
+            "provider_api_key_xai_connect": {
+                "method": "POST",
+                "path": "/api/providers/xai/api-key",
             },
         },
     }

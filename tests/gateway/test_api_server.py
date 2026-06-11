@@ -687,6 +687,8 @@ class TestCapabilitiesEndpoint:
             assert provider_api_key["gemini"]["disconnect"] == "/api/providers/gemini"
             assert provider_api_key["openrouter"]["connect"] == "/api/providers/openrouter/api-key"
             assert provider_api_key["openrouter"]["disconnect"] == "/api/providers/openrouter"
+            assert provider_api_key["xai"]["connect"] == "/api/providers/xai/api-key"
+            assert provider_api_key["xai"]["disconnect"] == "/api/providers/xai"
             assert data["features"]["provider_oauth"]["openai-codex"]["flow"] == "device_code"
             assert data["features"]["provider_status"] is True
             assert data["features"]["model_policy"] is True
@@ -698,6 +700,7 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["provider_api_key_connect"]["path"] == "/api/providers/{provider}/api-key"
             assert data["endpoints"]["provider_api_key_anthropic_connect"]["path"] == "/api/providers/anthropic/api-key"
             assert data["endpoints"]["provider_api_key_gemini_connect"]["path"] == "/api/providers/gemini/api-key"
+            assert data["endpoints"]["provider_api_key_xai_connect"]["path"] == "/api/providers/xai/api-key"
             assert data["endpoints"]["model_policy_apply"]["path"] == "/api/model-policy/apply"
             assert data["endpoints"]["model_policy_activate"]["path"] == "/api/model-policy/activate"
             assert data["endpoints"]["platform_configure"]["path"] == "/api/platforms/{platform}/configure"
@@ -920,6 +923,32 @@ class TestProviderOAuthEndpoint:
         assert env.get("GOOGLE_API_KEY", "") == ""
 
     @pytest.mark.asyncio
+    async def test_xai_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        remove_env_value("XAI_API_KEY")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/xai/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "xai-user-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "xai"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "xai-user-secret" not in str(data)
+        env = load_env()
+        assert env["XAI_API_KEY"] == "xai-user-secret"
+
+    @pytest.mark.asyncio
     async def test_anthropic_disconnect_clears_runtime_key(self, auth_adapter, monkeypatch):
         from hermes_cli.config import load_env, remove_env_value, save_env_value
 
@@ -982,6 +1011,33 @@ class TestProviderOAuthEndpoint:
         assert "GOOGLE_API_KEY" not in env
         remove_env_value("GEMINI_API_KEY")
         remove_env_value("GOOGLE_API_KEY")
+
+    @pytest.mark.asyncio
+    async def test_xai_disconnect_clears_runtime_key(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        save_env_value("XAI_API_KEY", "xai-user-secret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            disconnect = await cli.delete(
+                "/api/providers/xai",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "xai",
+            "active_policy_affected": False,
+        }
+        assert "xai-user-secret" not in str(data)
+        env = load_env()
+        assert "XAI_API_KEY" not in env
+        remove_env_value("XAI_API_KEY")
 
     @pytest.mark.asyncio
     async def test_openrouter_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
@@ -1074,6 +1130,8 @@ class TestProviderOAuthEndpoint:
                 "/api/providers/openrouter/api-key",
                 "/api/providers/gemini/api-key",
                 "/api/providers/gemini",
+                "/api/providers/xai/api-key",
+                "/api/providers/xai",
             ):
                 resp = await cli.options(path)
                 assert resp.status in {200, 204, 403, 405}
@@ -1089,6 +1147,7 @@ class TestProviderControlEndpoints:
     async def test_list_providers_returns_non_secret_status(self, auth_adapter, monkeypatch):
         monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
         monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+        monkeypatch.setenv("XAI_API_KEY", "xai-secret")
         monkeypatch.setattr(
             "hermes_cli.auth.get_codex_auth_status",
             lambda: {
@@ -1113,9 +1172,12 @@ class TestProviderControlEndpoints:
         assert providers["openai-codex"]["credential_fingerprint"].startswith("sha256:")
         assert providers["gemini"]["status"] == "connected"
         assert providers["openrouter"]["status"] == "connected"
+        assert providers["xai"]["status"] == "connected"
+        assert providers["xai"]["credential_fingerprint"].startswith("sha256:")
         assert "codex-secret-token" not in str(data)
         assert "gemini-secret" not in str(data)
         assert "openrouter-secret" not in str(data)
+        assert "xai-secret" not in str(data)
 
     @pytest.mark.asyncio
     async def test_model_policy_reads_primary_and_fallbacks(self, auth_adapter):
