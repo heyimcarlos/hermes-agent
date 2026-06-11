@@ -15,12 +15,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_dir, get_hermes_home
+from hermes_cli.platform_control_whatsapp import (
+    WHATSAPP_PLATFORM_ID,
+    apply_whatsapp_env,
+    configure_whatsapp_platform_config,
+    start_whatsapp_pairing,
+    validate_whatsapp_payload,
+    whatsapp_config_override,
+    whatsapp_session_paired,
+    whatsapp_status,
+)
 
 
 TELEGRAM_PLATFORM_ID = "telegram"
 DISCORD_PLATFORM_ID = "discord"
-SUPPORTED_PLATFORM_IDS = (TELEGRAM_PLATFORM_ID, DISCORD_PLATFORM_ID)
+SUPPORTED_PLATFORM_IDS = (
+    TELEGRAM_PLATFORM_ID,
+    DISCORD_PLATFORM_ID,
+    WHATSAPP_PLATFORM_ID,
+)
 RUNTIME_STATE_VERSION = 1
 
 _TELEGRAM_TOKEN_RE = re.compile(r"^\d{5,20}:[A-Za-z0-9_-]{20,}$")
@@ -105,7 +119,20 @@ def platform_control_capabilities() -> Dict[str, Dict[str, Any]]:
                         "require_mention",
                     ],
                     "toolsets": list(_DISCORD_DEFAULT_TOOLSETS),
-                }
+                },
+                WHATSAPP_PLATFORM_ID: {
+                    "configure": True,
+                    "hot_apply": True,
+                    "credentials": [],
+                    "configuration": [
+                        "mode",
+                        "allowed_users",
+                        "dm_policy",
+                        "group_policy",
+                        "restart_pairing",
+                    ],
+                    "pairing": ["qr", "status"],
+                },
             },
         },
         "endpoints": {
@@ -123,6 +150,10 @@ def platform_control_capabilities() -> Dict[str, Dict[str, Any]]:
                 "method": "POST",
                 "path": "/api/platforms/discord/configure",
             },
+            "whatsapp_configure": {
+                "method": "POST",
+                "path": "/api/platforms/whatsapp/configure",
+            },
         },
     }
 
@@ -138,6 +169,8 @@ def runtime_platform_config_overrides() -> Dict[str, Dict[str, Any]]:
             overrides[platform] = _telegram_config_override(state)
         elif platform == DISCORD_PLATFORM_ID:
             overrides[platform] = _discord_config_override(state)
+        elif platform == WHATSAPP_PLATFORM_ID:
+            overrides[platform] = whatsapp_config_override(state)
     return overrides
 
 
@@ -168,6 +201,8 @@ def get_platform(platform_id: str, *, runner: Any = None) -> Dict[str, Any]:
         return _telegram_status(runner=runner)
     if platform == DISCORD_PLATFORM_ID:
         return _discord_status(runner=runner)
+    if platform == WHATSAPP_PLATFORM_ID:
+        return _whatsapp_status(runner=runner)
     raise UnsupportedPlatformError(platform)
 
 
@@ -185,6 +220,8 @@ async def configure_platform(
         state = _validate_telegram_payload(payload)
     elif platform == DISCORD_PLATFORM_ID:
         state = _validate_discord_payload(payload)
+    elif platform == WHATSAPP_PLATFORM_ID:
+        state = _validate_whatsapp_payload(payload)
     else:
         raise UnsupportedPlatformError(platform)
     _write_platform_state(platform, state)
@@ -194,6 +231,8 @@ async def configure_platform(
             _telegram_status(runner=None, persisted_state=state)
             if platform == TELEGRAM_PLATFORM_ID
             else _discord_status(runner=None, persisted_state=state)
+            if platform == DISCORD_PLATFORM_ID
+            else _whatsapp_status(runner=None, persisted_state=state)
         )
         status["state"] = "disconnected"
         status["connected"] = False
@@ -209,15 +248,22 @@ async def configure_platform(
             "status": status,
         }
 
-    apply_result = (
-        await _hot_apply_telegram(state, runner)
-        if platform == TELEGRAM_PLATFORM_ID
-        else await _hot_apply_discord(state, runner)
-    )
+    if platform == WHATSAPP_PLATFORM_ID and not whatsapp_session_paired(state):
+        apply_result = _start_whatsapp_pairing(state)
+    else:
+        apply_result = (
+            await _hot_apply_telegram(state, runner)
+            if platform == TELEGRAM_PLATFORM_ID
+            else await _hot_apply_discord(state, runner)
+            if platform == DISCORD_PLATFORM_ID
+            else await _hot_apply_whatsapp(state, runner)
+        )
     status = (
         _telegram_status(runner=runner, persisted_state=state)
         if platform == TELEGRAM_PLATFORM_ID
         else _discord_status(runner=runner, persisted_state=state)
+        if platform == DISCORD_PLATFORM_ID
+        else _whatsapp_status(runner=runner, persisted_state=state)
     )
     error_message = _redact_state_secrets(state, apply_result.get("error_message"))
     ok = bool(apply_result.get("applied") and not apply_result.get("restart_required"))
@@ -866,6 +912,17 @@ def _discord_config_override(state: Dict[str, Any]) -> Dict[str, Any]:
     return override
 
 
+def _validate_whatsapp_payload(payload: Any) -> Dict[str, Any]:
+    state, errors = validate_whatsapp_payload(
+        payload,
+        runtime_state_version=RUNTIME_STATE_VERSION,
+        utc_now_iso=_utc_now_iso,
+    )
+    if state is None:
+        raise PlatformValidationError(WHATSAPP_PLATFORM_ID, errors)
+    return state
+
+
 def _apply_platform_env(
     platform: str,
     state: Dict[str, Any],
@@ -878,6 +935,16 @@ def _apply_platform_env(
     allowed_users = (
         configuration.get("allowed_users") if isinstance(configuration, dict) else []
     )
+    if platform == WHATSAPP_PLATFORM_ID:
+        apply_whatsapp_env(state, set_env=_set_env, overwrite=overwrite)
+        return
+    if platform == TELEGRAM_PLATFORM_ID:
+        prefix = "TELEGRAM"
+    elif platform == DISCORD_PLATFORM_ID:
+        prefix = "DISCORD"
+    else:
+        return
+
     allowed_roles = (
         configuration.get("allowed_roles") if isinstance(configuration, dict) else []
     )
@@ -885,13 +952,6 @@ def _apply_platform_env(
         configuration.get("home_channel") if isinstance(configuration, dict) else {}
     )
     token = credentials.get("bot_token") if isinstance(credentials, dict) else None
-
-    if platform == TELEGRAM_PLATFORM_ID:
-        prefix = "TELEGRAM"
-    elif platform == DISCORD_PLATFORM_ID:
-        prefix = "DISCORD"
-    else:
-        return
 
     _set_env(f"{prefix}_ALLOWED_USERS", ",".join(str(v) for v in allowed_users), overwrite)
     if platform == DISCORD_PLATFORM_ID and isinstance(configuration, dict):
@@ -971,6 +1031,17 @@ async def _hot_apply_discord(state: Dict[str, Any], runner: Any) -> Dict[str, An
     )
 
 
+async def _hot_apply_whatsapp(state: Dict[str, Any], runner: Any) -> Dict[str, Any]:
+    return await _hot_apply_platform(
+        state,
+        runner,
+        platform_id=WHATSAPP_PLATFORM_ID,
+        label="WhatsApp",
+        configure_platform_config=configure_whatsapp_platform_config,
+        token_key=None,
+    )
+
+
 async def _hot_apply_platform(
     state: Dict[str, Any],
     runner: Any,
@@ -978,6 +1049,7 @@ async def _hot_apply_platform(
     platform_id: str,
     label: str,
     configure_platform_config: Any,
+    token_key: Optional[str] = "bot_token",
 ) -> Dict[str, Any]:
     required_attrs = ("config", "adapters", "_create_adapter")
     if not all(hasattr(runner, attr) for attr in required_attrs):
@@ -992,7 +1064,7 @@ async def _hot_apply_platform(
             platform_config = PlatformConfig()
             runner.config.platforms[platform] = platform_config
 
-        credentials = state["credentials"]
+        credentials = state.get("credentials") or {}
         _apply_platform_env(
             platform_id,
             state,
@@ -1002,7 +1074,8 @@ async def _hot_apply_platform(
         configure_platform_config(platform_config, state, HomeChannel)
 
         platform_config.enabled = True
-        platform_config.token = credentials["bot_token"]
+        if token_key is not None:
+            platform_config.token = credentials[token_key]
         _apply_platform_env(platform_id, state, overwrite=True)
 
         existing = runner.adapters.get(platform)
@@ -1336,6 +1409,23 @@ def _discord_status(
     }
 
 
+def _whatsapp_status(
+    *,
+    runner: Any = None,
+    persisted_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    persisted_state = persisted_state or _read_platform_state(WHATSAPP_PLATFORM_ID)
+    return whatsapp_status(
+        runner=runner,
+        persisted_state=persisted_state,
+        runtime_platform_status=_runtime_platform_status,
+        runner_platform_config=_runner_platform_config,
+        runner_platform_connected=_runner_platform_connected,
+        state_updated_at=_state_updated_at,
+        redact_state_secrets=_redact_state_secrets,
+    )
+
+
 def _state_updated_at(state: Optional[Dict[str, Any]]) -> Optional[str]:
     if isinstance(state, dict):
         updated_at = state.get("updated_at")
@@ -1559,6 +1649,14 @@ def _discord_home_channel_for_status(
     if isinstance(home, dict) and home.get("chat_id"):
         return _public_home_channel(home, default_platform=DISCORD_PLATFORM_ID)
     return None
+
+
+def _start_whatsapp_pairing(state: Dict[str, Any]) -> Dict[str, Any]:
+    return start_whatsapp_pairing(
+        state,
+        apply_env=_apply_platform_env,
+        utc_now_iso=_utc_now_iso,
+    )
 
 
 def _public_home_channel(

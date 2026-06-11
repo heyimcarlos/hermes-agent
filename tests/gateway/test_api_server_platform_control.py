@@ -37,6 +37,11 @@ def isolated_hermes_home(tmp_path, monkeypatch):
         "DISCORD_HOME_CHANNEL",
         "DISCORD_HOME_CHANNEL_NAME",
         "DISCORD_HOME_CHANNEL_THREAD_ID",
+        "WHATSAPP_ENABLED",
+        "WHATSAPP_MODE",
+        "WHATSAPP_ALLOWED_USERS",
+        "WHATSAPP_DM_POLICY",
+        "WHATSAPP_GROUP_POLICY",
     ):
         monkeypatch.delenv(key, raising=False)
     return hermes_home
@@ -70,6 +75,15 @@ def _discord_payload() -> dict:
             "name": "#agent",
             "thread_id": "339993333333333333",
         },
+    }
+
+
+def _whatsapp_payload() -> dict:
+    return {
+        "mode": "bot",
+        "allowed_users": ["15551234567"],
+        "dm_policy": "allowlist",
+        "group_policy": "disabled",
     }
 
 
@@ -393,13 +407,69 @@ async def test_configure_telegram_validation_failure_is_typed():
 
 
 @pytest.mark.asyncio
+async def test_configure_whatsapp_starts_pairing_without_session(monkeypatch):
+    from hermes_cli import platform_control_whatsapp
+
+    adapter = _make_adapter()
+    runner = FakeGatewayRunner()
+    adapter.gateway_runner = runner
+    app = _create_app(adapter)
+
+    def fake_pairing_status(state, *, utc_now_iso):
+        session_dir = platform_control_whatsapp.whatsapp_session_dir(state)
+        platform_control_whatsapp.write_whatsapp_pairing_status(
+            session_dir,
+            {
+                "status": "qr_ready",
+                "qr": "terminal qr",
+                "mode": "bot",
+            },
+            utc_now_iso=utc_now_iso,
+        )
+        return platform_control_whatsapp.whatsapp_pairing_status(state)
+
+    monkeypatch.setattr(
+        platform_control_whatsapp,
+        "ensure_whatsapp_pairing_process",
+        fake_pairing_status,
+    )
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/platforms/whatsapp/configure",
+            headers={"Authorization": "Bearer sk-secret"},
+            json=_whatsapp_payload(),
+        )
+        data = await resp.json()
+
+    assert resp.status == 500
+    assert data["ok"] is False
+    assert data["platform"] == "whatsapp"
+    assert data["configured"] is True
+    assert data["applied"] is False
+    assert data["restart_required"] is False
+    assert data["state"] == "pairing"
+    assert data["error_code"] == "whatsapp_not_paired"
+    assert data["status"]["id"] == "whatsapp"
+    assert data["status"]["configured"] is True
+    assert data["status"]["state"] == "pairing"
+    assert data["status"]["allowed_users"] == ["15551234567"]
+    assert data["status"]["pairing"]["status"] == "qr_ready"
+    assert data["status"]["pairing"]["qr"] == "terminal qr"
+    assert os.getenv("WHATSAPP_ENABLED") == "true"
+    assert os.getenv("WHATSAPP_MODE") == "bot"
+    assert os.getenv("WHATSAPP_ALLOWED_USERS") == "15551234567"
+    assert os.getenv("WHATSAPP_GROUP_POLICY") == "disabled"
+
+
+@pytest.mark.asyncio
 async def test_unsupported_platform_returns_typed_response():
     adapter = _make_adapter()
     app = _create_app(adapter)
 
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
-            "/api/platforms/whatsapp/configure",
+            "/api/platforms/signal/configure",
             headers={"Authorization": "Bearer sk-secret"},
             json={},
         )
@@ -407,7 +477,7 @@ async def test_unsupported_platform_returns_typed_response():
 
     assert resp.status == 400
     assert data["ok"] is False
-    assert data["platform"] == "whatsapp"
+    assert data["platform"] == "signal"
     assert data["supported"] is False
     assert data["error_code"] == "unsupported_platform"
 
@@ -558,3 +628,14 @@ async def test_runtime_platform_state_loads_into_gateway_config():
     assert discord.extra["free_response_channels"] == ["229992222222222222"]
     assert discord.extra["require_mention"] is True
     assert discord.home_channel.chat_id == "229992222222222222"
+
+    whatsapp_result = await configure_platform("whatsapp", _whatsapp_payload(), runner=None)
+    assert whatsapp_result["restart_required"] is True
+
+    config = load_gateway_config()
+    whatsapp = config.platforms[Platform.WHATSAPP]
+    assert whatsapp.enabled is True
+    assert whatsapp.extra["mode"] == "bot"
+    assert whatsapp.extra["allow_from"] == ["15551234567"]
+    assert whatsapp.extra["dm_policy"] == "allowlist"
+    assert whatsapp.extra["group_policy"] == "disabled"
