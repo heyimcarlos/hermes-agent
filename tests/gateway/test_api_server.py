@@ -680,6 +680,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["provider_api_key"]["anthropic"]["connect"] == "/api/providers/anthropic/api-key"
             assert data["features"]["provider_api_key"]["openrouter"]["connect"] == "/api/providers/openrouter/api-key"
             assert data["features"]["provider_oauth"]["openai-codex"]["flow"] == "device_code"
             assert data["features"]["provider_status"] is True
@@ -690,6 +691,7 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["providers"]["path"] == "/api/providers"
             assert data["endpoints"]["provider_api_key_connect"]["path"] == "/api/providers/{provider}/api-key"
+            assert data["endpoints"]["provider_api_key_anthropic_connect"]["path"] == "/api/providers/anthropic/api-key"
             assert data["endpoints"]["model_policy_apply"]["path"] == "/api/model-policy/apply"
             assert data["endpoints"]["model_policy_activate"]["path"] == "/api/model-policy/activate"
             assert data["endpoints"]["platform_configure"]["path"] == "/api/platforms/{platform}/configure"
@@ -854,6 +856,67 @@ class TestProviderOAuthEndpoint:
             assert data["error"]["message"] == "api_key is required"
 
     @pytest.mark.asyncio
+    async def test_anthropic_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        remove_env_value("ANTHROPIC_API_KEY")
+        remove_env_value("ANTHROPIC_TOKEN")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/anthropic/api-key",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"api_key": "sk-ant-api03-user-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["connected"] is True
+        assert data["provider"] == "anthropic"
+        assert data["connection_kind"] == "api_key"
+        assert data["credential_fingerprint"].startswith("sha256:")
+        assert data["restart_required"] is False
+        assert "sk-ant-api03-user-secret" not in str(data)
+        env = load_env()
+        assert env["ANTHROPIC_API_KEY"] == "sk-ant-api03-user-secret"
+        assert env.get("ANTHROPIC_TOKEN", "") == ""
+
+    @pytest.mark.asyncio
+    async def test_anthropic_disconnect_clears_runtime_key(self, auth_adapter, monkeypatch):
+        from hermes_cli.config import load_env, remove_env_value, save_env_value
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        save_env_value("ANTHROPIC_API_KEY", "sk-ant-api03-user-secret")
+        save_env_value("ANTHROPIC_TOKEN", "legacy-token-secret")
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            disconnect = await cli.delete(
+                "/api/providers/anthropic",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert disconnect.status == 200
+            data = await disconnect.json()
+
+        assert data == {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": "anthropic",
+            "active_policy_affected": False,
+        }
+        assert "sk-ant-api03-user-secret" not in str(data)
+        assert "legacy-token-secret" not in str(data)
+        env = load_env()
+        assert "ANTHROPIC_API_KEY" not in env
+        assert "ANTHROPIC_TOKEN" not in env
+        remove_env_value("ANTHROPIC_API_KEY")
+        remove_env_value("ANTHROPIC_TOKEN")
+
+    @pytest.mark.asyncio
     async def test_openrouter_api_key_connect_persists_without_exposing_secret(self, auth_adapter, monkeypatch):
         from hermes_cli.config import load_env, remove_env_value
 
@@ -940,6 +1003,7 @@ class TestProviderOAuthEndpoint:
                 "/api/providers/oauth/openai-codex/poll/session-1",
                 "/api/providers/openai-codex",
                 "/api/providers/oauth/openai-codex",
+                "/api/providers/anthropic/api-key",
                 "/api/providers/openrouter/api-key",
             ):
                 resp = await cli.options(path)

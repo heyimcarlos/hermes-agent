@@ -25,6 +25,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
     return {
         "features": {
             "provider_api_key": {
+                "anthropic": {
+                    "connect": "/api/providers/anthropic/api-key",
+                    "disconnect": "/api/providers/anthropic",
+                },
                 "openrouter": {
                     "connect": "/api/providers/openrouter/api-key",
                     "disconnect": "/api/providers/openrouter",
@@ -87,6 +91,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
             "provider_api_key_openrouter_connect": {
                 "method": "POST",
                 "path": "/api/providers/openrouter/api-key",
+            },
+            "provider_api_key_anthropic_connect": {
+                "method": "POST",
+                "path": "/api/providers/anthropic/api-key",
             },
         },
     }

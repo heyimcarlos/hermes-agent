@@ -8,7 +8,10 @@ from typing import Any, Dict, List, Optional
 
 
 CODEX_PROVIDER_ID = "openai-codex"
+ANTHROPIC_PROVIDER_ID = "anthropic"
 OPENROUTER_PROVIDER_ID = "openrouter"
+ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+ANTHROPIC_TOKEN_ENV = "ANTHROPIC_TOKEN"
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV = "TRYAGENT_MANAGED_OPENROUTER_API_KEY"
 TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV = "TRYAGENT_OPENROUTER_CONNECTION_KIND"
@@ -21,6 +24,7 @@ def list_providers() -> Dict[str, Any]:
     return {
         "providers": [
             _provider_status(CODEX_PROVIDER_ID, policy),
+            _provider_status(ANTHROPIC_PROVIDER_ID, policy),
             _provider_status(OPENROUTER_PROVIDER_ID, policy),
         ]
     }
@@ -29,7 +33,7 @@ def list_providers() -> Dict[str, Any]:
 def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
     """Persist an API-key provider credential without exposing it in responses."""
     provider = _normalize_provider(provider_id)
-    if provider != OPENROUTER_PROVIDER_ID:
+    if provider not in {ANTHROPIC_PROVIDER_ID, OPENROUTER_PROVIDER_ID}:
         raise ValueError(f"Unsupported API-key provider connect: {provider_id}")
 
     if not isinstance(api_key, str):
@@ -41,16 +45,19 @@ def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
     if not key:
         raise ValueError("api_key is required")
 
-    current_key = _openrouter_api_key()
-    current_kind = _openrouter_connection_kind()
-    if current_key and current_kind != TRYAGENT_USER_OPENROUTER_CONNECTION_KIND:
-        _save_env_value(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV, current_key)
+    if provider == ANTHROPIC_PROVIDER_ID:
+        _save_anthropic_api_key(key)
+    else:
+        current_key = _openrouter_api_key()
+        current_kind = _openrouter_connection_kind()
+        if current_key and current_kind != TRYAGENT_USER_OPENROUTER_CONNECTION_KIND:
+            _save_env_value(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV, current_key)
 
-    _save_env_value(OPENROUTER_API_KEY_ENV, key)
-    _save_env_value(
-        TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV,
-        TRYAGENT_USER_OPENROUTER_CONNECTION_KIND,
-    )
+        _save_env_value(OPENROUTER_API_KEY_ENV, key)
+        _save_env_value(
+            TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV,
+            TRYAGENT_USER_OPENROUTER_CONNECTION_KIND,
+        )
 
     policy = get_model_policy()
     return {
@@ -67,7 +74,7 @@ def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
 def disconnect_provider(provider_id: str) -> Dict[str, Any]:
     """Clear provider credentials without mutating the active model policy."""
     provider = _normalize_provider(provider_id)
-    if provider not in {CODEX_PROVIDER_ID, OPENROUTER_PROVIDER_ID}:
+    if provider not in {ANTHROPIC_PROVIDER_ID, CODEX_PROVIDER_ID, OPENROUTER_PROVIDER_ID}:
         raise ValueError(f"Unsupported provider disconnect: {provider_id}")
 
     policy = get_model_policy()
@@ -87,6 +94,17 @@ def disconnect_provider(provider_id: str) -> Dict[str, Any]:
             "provider": provider,
             "active_policy_affected": active_policy_affected,
             "managed_credential_restored": bool(managed_key),
+        }
+
+    if provider == ANTHROPIC_PROVIDER_ID:
+        credential_removed = _remove_env_value(ANTHROPIC_API_KEY_ENV)
+        credential_removed = _remove_env_value(ANTHROPIC_TOKEN_ENV) or credential_removed
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": credential_removed,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
         }
 
     from hermes_cli.provider_oauth import disconnect_codex
@@ -230,6 +248,8 @@ def restore_model_policy_config(config: Dict[str, Any]) -> Dict[str, Any]:
 def _provider_status(provider: str, policy: Dict[str, Any]) -> Dict[str, Any]:
     if provider == CODEX_PROVIDER_ID:
         return _codex_status(policy)
+    if provider == ANTHROPIC_PROVIDER_ID:
+        return _anthropic_status(policy)
     if provider == OPENROUTER_PROVIDER_ID:
         return _openrouter_status(policy)
     raise ValueError(f"Unsupported provider: {provider}")
@@ -256,6 +276,23 @@ def _codex_status(policy: Dict[str, Any]) -> Dict[str, Any]:
             "start": f"/api/providers/oauth/{CODEX_PROVIDER_ID}/start",
             "poll": f"/api/providers/oauth/{CODEX_PROVIDER_ID}/poll/{{session_id}}",
         },
+        "model_policy": True,
+    }
+
+
+def _anthropic_status(policy: Dict[str, Any]) -> Dict[str, Any]:
+    token = _anthropic_api_key()
+    connected = bool(token)
+    return {
+        "id": ANTHROPIC_PROVIDER_ID,
+        "name": "Anthropic",
+        "connection_kind": "api_key",
+        "status": "connected" if connected else "disconnected",
+        "connected": connected,
+        "credential_fingerprint": _secret_fingerprint(token),
+        "last_error_message": None,
+        "active_policy": _policy_mentions_provider(policy, ANTHROPIC_PROVIDER_ID),
+        "oauth": None,
         "model_policy": True,
     }
 
@@ -287,6 +324,25 @@ def _openrouter_api_key() -> str:
     except Exception:
         pass
     return os.getenv(OPENROUTER_API_KEY_ENV, "")
+
+
+def _anthropic_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        for key in (ANTHROPIC_API_KEY_ENV, ANTHROPIC_TOKEN_ENV):
+            value = get_env_value(key)
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return os.getenv(ANTHROPIC_API_KEY_ENV, "") or os.getenv(ANTHROPIC_TOKEN_ENV, "")
+
+
+def _save_anthropic_api_key(value: str) -> None:
+    from hermes_cli.config import save_anthropic_api_key
+
+    save_anthropic_api_key(value)
 
 
 def _managed_openrouter_api_key() -> str:
