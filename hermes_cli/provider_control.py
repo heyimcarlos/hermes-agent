@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional
 
 CODEX_PROVIDER_ID = "openai-codex"
 OPENROUTER_PROVIDER_ID = "openrouter"
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV = "TRYAGENT_MANAGED_OPENROUTER_API_KEY"
+TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV = "TRYAGENT_OPENROUTER_CONNECTION_KIND"
+TRYAGENT_USER_OPENROUTER_CONNECTION_KIND = "user_api_key"
 
 
 def list_providers() -> Dict[str, Any]:
@@ -22,14 +26,68 @@ def list_providers() -> Dict[str, Any]:
     }
 
 
+def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
+    """Persist an API-key provider credential without exposing it in responses."""
+    provider = _normalize_provider(provider_id)
+    if provider != OPENROUTER_PROVIDER_ID:
+        raise ValueError(f"Unsupported API-key provider connect: {provider_id}")
+
+    if not isinstance(api_key, str):
+        raise ValueError("api_key is required")
+
+    key = api_key.strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    if not key:
+        raise ValueError("api_key is required")
+
+    current_key = _openrouter_api_key()
+    current_kind = _openrouter_connection_kind()
+    if current_key and current_kind != TRYAGENT_USER_OPENROUTER_CONNECTION_KIND:
+        _save_env_value(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV, current_key)
+
+    _save_env_value(OPENROUTER_API_KEY_ENV, key)
+    _save_env_value(
+        TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV,
+        TRYAGENT_USER_OPENROUTER_CONNECTION_KIND,
+    )
+
+    policy = get_model_policy()
+    return {
+        "ok": True,
+        "connected": True,
+        "provider": provider,
+        "connection_kind": "api_key",
+        "credential_fingerprint": _secret_fingerprint(key),
+        "active_policy": _policy_mentions_provider(policy, provider),
+        "restart_required": False,
+    }
+
+
 def disconnect_provider(provider_id: str) -> Dict[str, Any]:
     """Clear provider credentials without mutating the active model policy."""
     provider = _normalize_provider(provider_id)
-    if provider != CODEX_PROVIDER_ID:
+    if provider not in {CODEX_PROVIDER_ID, OPENROUTER_PROVIDER_ID}:
         raise ValueError(f"Unsupported provider disconnect: {provider_id}")
 
     policy = get_model_policy()
     active_policy_affected = _policy_mentions_provider(policy, provider)
+
+    if provider == OPENROUTER_PROVIDER_ID:
+        managed_key = _managed_openrouter_api_key()
+        if managed_key:
+            _save_env_value(OPENROUTER_API_KEY_ENV, managed_key)
+        else:
+            _remove_env_value(OPENROUTER_API_KEY_ENV)
+        _remove_env_value(TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV)
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": True,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
+            "managed_credential_restored": bool(managed_key),
+        }
 
     from hermes_cli.provider_oauth import disconnect_codex
 
@@ -223,12 +281,48 @@ def _openrouter_api_key() -> str:
     try:
         from hermes_cli.config import get_env_value
 
-        value = get_env_value("OPENROUTER_API_KEY")
+        value = get_env_value(OPENROUTER_API_KEY_ENV)
         if value:
             return str(value)
     except Exception:
         pass
-    return os.getenv("OPENROUTER_API_KEY", "")
+    return os.getenv(OPENROUTER_API_KEY_ENV, "")
+
+
+def _managed_openrouter_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV, "")
+
+
+def _openrouter_connection_kind() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        value = get_env_value(TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV, "")
+
+
+def _save_env_value(key: str, value: str) -> None:
+    from hermes_cli.config import save_env_value
+
+    save_env_value(key, value)
+
+
+def _remove_env_value(key: str) -> bool:
+    from hermes_cli.config import remove_env_value
+
+    return bool(remove_env_value(key))
 
 
 def _read_raw_config() -> Dict[str, Any]:
