@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - api_server gates startup on aiohttp
 
 
 logger = logging.getLogger(__name__)
+_MODEL_POLICY_ACTIVATION_LOCK = asyncio.Lock()
 
 Handler = Callable[[Any, Any], Awaitable[Any]]
 
@@ -56,6 +57,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
             "model_policy_apply": {
                 "method": "POST",
                 "path": "/api/model-policy/apply",
+            },
+            "model_policy_activate": {
+                "method": "POST",
+                "path": "/api/model-policy/activate",
             },
             "provider_oauth_codex_start": {
                 "method": "POST",
@@ -100,6 +105,10 @@ def register_provider_control_routes(app: Any, adapter: Any) -> None:
     app.router.add_post(
         "/api/model-policy/apply",
         _bind(adapter, _handle_model_policy_apply),
+    )
+    app.router.add_post(
+        "/api/model-policy/activate",
+        _bind(adapter, _handle_model_policy_activate),
     )
 
 
@@ -213,6 +222,106 @@ async def _handle_model_policy_apply(adapter: Any, request: Any) -> Any:
         )
 
 
+async def _handle_model_policy_activate(adapter: Any, request: Any) -> Any:
+    auth_err = _check_auth(adapter, request)
+    if auth_err:
+        return auth_err
+
+    body = await _json_body(request)
+    if _is_response(body):
+        return body
+
+    async with _MODEL_POLICY_ACTIVATION_LOCK:
+        try:
+            from hermes_cli.provider_control import (
+                apply_model_policy,
+                restore_model_policy_config,
+                snapshot_model_policy_config,
+                validate_model_policy,
+            )
+
+            previous_config = await asyncio.to_thread(snapshot_model_policy_config)
+            validation = await asyncio.to_thread(validate_model_policy, body)
+            if not validation.get("valid"):
+                return _json_response(
+                    {
+                        "ok": False,
+                        "activated": False,
+                        "applied": False,
+                        **validation,
+                    },
+                    status=400,
+                )
+
+            apply_result = await asyncio.to_thread(apply_model_policy, body)
+            if not apply_result.get("ok"):
+                return _json_response(
+                    {
+                        "ok": False,
+                        "activated": False,
+                        **apply_result,
+                    },
+                    status=400,
+                )
+
+            try:
+                await _refresh_runtime_model_policy(adapter)
+                smoke = await _smoke_model_policy(adapter)
+            except Exception as exc:
+                restored = False
+                restored_policy = None
+                restore_error = None
+                try:
+                    restored_policy = await asyncio.to_thread(
+                        restore_model_policy_config,
+                        previous_config,
+                    )
+                    restored = True
+                    await _refresh_runtime_model_policy(adapter)
+                except Exception as rollback_exc:
+                    logger.exception("model policy rollback failed")
+                    restore_error = str(rollback_exc) or "Model policy rollback failed"
+
+                logger.warning("model policy activation failed after apply: %s", exc)
+                response = {
+                    "ok": False,
+                    "activated": False,
+                    "applied": False,
+                    "valid": True,
+                    "errors": [],
+                    "policy": restored_policy if restored else validation.get("policy"),
+                    "attempted_policy": validation.get("policy"),
+                    "restart_required": validation.get("restart_required", False),
+                    "restored": restored,
+                    "smoke": {
+                        "ok": False,
+                        "error": str(exc) or "Model policy activation failed",
+                    },
+                }
+                if restore_error:
+                    response["restore_error"] = restore_error
+                return _json_response(response, status=500 if restore_error else 409)
+
+            return _json_response(
+                {
+                    "ok": True,
+                    "activated": True,
+                    "applied": True,
+                    "valid": True,
+                    "errors": [],
+                    "policy": apply_result.get("policy"),
+                    "restart_required": apply_result.get("restart_required", False),
+                    "smoke": smoke,
+                }
+            )
+        except Exception as exc:
+            logger.exception("model policy activation failed")
+            return _json_response(
+                _openai_error(str(exc) or "Model policy activation failed"),
+                status=500,
+            )
+
+
 async def _handle_provider_oauth_start(adapter: Any, request: Any) -> Any:
     auth_err = _check_auth(adapter, request)
     if auth_err:
@@ -279,6 +388,30 @@ async def _handle_provider_disconnect(adapter: Any, request: Any) -> Any:
             _openai_error(str(exc) or "Provider OAuth disconnect failed"),
             status=500,
         )
+
+
+async def _refresh_runtime_model_policy(adapter: Any) -> None:
+    refresh = getattr(adapter, "_refresh_runtime_model_policy", None)
+    if callable(refresh):
+        await asyncio.to_thread(refresh)
+
+    runner = getattr(adapter, "gateway_runner", None)
+    runner_refresh = getattr(runner, "_refresh_runtime_model_policy", None)
+    if callable(runner_refresh):
+        await asyncio.to_thread(runner_refresh)
+
+
+async def _smoke_model_policy(adapter: Any) -> Dict[str, Any]:
+    smoke = getattr(adapter, "_smoke_model_policy", None)
+    if not callable(smoke):
+        raise RuntimeError("API server adapter cannot smoke model policy")
+
+    result = smoke()
+    if asyncio.iscoroutine(result):
+        result = await result
+    if not isinstance(result, dict):
+        raise RuntimeError("Model policy smoke returned an invalid result")
+    return result
 
 
 def _openai_error(
