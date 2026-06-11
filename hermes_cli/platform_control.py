@@ -19,12 +19,16 @@ from hermes_constants import get_hermes_home
 
 
 TELEGRAM_PLATFORM_ID = "telegram"
-SUPPORTED_PLATFORM_IDS = (TELEGRAM_PLATFORM_ID,)
+DISCORD_PLATFORM_ID = "discord"
+SUPPORTED_PLATFORM_IDS = (TELEGRAM_PLATFORM_ID, DISCORD_PLATFORM_ID)
 RUNTIME_STATE_VERSION = 1
 
 _TELEGRAM_TOKEN_RE = re.compile(r"^\d{5,20}:[A-Za-z0-9_-]{20,}$")
 _TELEGRAM_USER_ID_RE = re.compile(r"^[1-9]\d{0,19}$")
 _TELEGRAM_CHAT_ID_RE = re.compile(r"^-?[1-9]\d{0,19}$")
+_DISCORD_TOKEN_RE = re.compile(r"^[A-Za-z0-9._=-]{20,256}$")
+_DISCORD_SNOWFLAKE_RE = re.compile(r"^[1-9]\d{4,24}$")
+_DISCORD_DEFAULT_TOOLSETS = ("discord", "discord_admin")
 
 
 class PlatformControlError(Exception):
@@ -89,6 +93,18 @@ def platform_control_capabilities() -> Dict[str, Dict[str, Any]]:
                     "hot_apply": True,
                     "credentials": ["bot_token"],
                     "configuration": ["allowed_users", "home_channel"],
+                },
+                DISCORD_PLATFORM_ID: {
+                    "configure": True,
+                    "hot_apply": True,
+                    "credentials": ["bot_token"],
+                    "configuration": [
+                        "allowed_users",
+                        "allowed_roles",
+                        "home_channel",
+                        "require_mention",
+                    ],
+                    "toolsets": list(_DISCORD_DEFAULT_TOOLSETS),
                 }
             },
         },
@@ -103,6 +119,10 @@ def platform_control_capabilities() -> Dict[str, Dict[str, Any]]:
                 "method": "POST",
                 "path": "/api/platforms/telegram/configure",
             },
+            "discord_configure": {
+                "method": "POST",
+                "path": "/api/platforms/discord/configure",
+            },
         },
     }
 
@@ -116,6 +136,8 @@ def runtime_platform_config_overrides() -> Dict[str, Dict[str, Any]]:
             continue
         if platform == TELEGRAM_PLATFORM_ID:
             overrides[platform] = _telegram_config_override(state)
+        elif platform == DISCORD_PLATFORM_ID:
+            overrides[platform] = _discord_config_override(state)
     return overrides
 
 
@@ -144,6 +166,8 @@ def get_platform(platform_id: str, *, runner: Any = None) -> Dict[str, Any]:
         raise UnsupportedPlatformError(platform)
     if platform == TELEGRAM_PLATFORM_ID:
         return _telegram_status(runner=runner)
+    if platform == DISCORD_PLATFORM_ID:
+        return _discord_status(runner=runner)
     raise UnsupportedPlatformError(platform)
 
 
@@ -157,14 +181,20 @@ async def configure_platform(
     platform = _normalize_platform(platform_id)
     if platform not in SUPPORTED_PLATFORM_IDS:
         raise UnsupportedPlatformError(platform)
-    if platform != TELEGRAM_PLATFORM_ID:
+    if platform == TELEGRAM_PLATFORM_ID:
+        state = _validate_telegram_payload(payload)
+    elif platform == DISCORD_PLATFORM_ID:
+        state = _validate_discord_payload(payload)
+    else:
         raise UnsupportedPlatformError(platform)
-
-    state = _validate_telegram_payload(payload)
     _write_platform_state(platform, state)
 
     if runner is None:
-        status = _telegram_status(runner=None, persisted_state=state)
+        status = (
+            _telegram_status(runner=None, persisted_state=state)
+            if platform == TELEGRAM_PLATFORM_ID
+            else _discord_status(runner=None, persisted_state=state)
+        )
         status["state"] = "disconnected"
         status["connected"] = False
         return {
@@ -179,8 +209,16 @@ async def configure_platform(
             "status": status,
         }
 
-    apply_result = await _hot_apply_telegram(state, runner)
-    status = _telegram_status(runner=runner, persisted_state=state)
+    apply_result = (
+        await _hot_apply_telegram(state, runner)
+        if platform == TELEGRAM_PLATFORM_ID
+        else await _hot_apply_discord(state, runner)
+    )
+    status = (
+        _telegram_status(runner=runner, persisted_state=state)
+        if platform == TELEGRAM_PLATFORM_ID
+        else _discord_status(runner=runner, persisted_state=state)
+    )
     error_message = _redact_state_secrets(state, apply_result.get("error_message"))
     ok = bool(apply_result.get("applied") and not apply_result.get("restart_required"))
     return {
@@ -420,6 +458,61 @@ def _telegram_home_channel_from_payload(
     return result
 
 
+def _discord_snowflake_list_from_payload(
+    payload: Dict[str, Any],
+    errors: List[Dict[str, str]],
+    *,
+    keys: tuple[str, ...],
+    path: str,
+    label: str,
+    required: bool,
+) -> List[str]:
+    config = _payload_config(payload)
+    raw = None
+    for key in keys:
+        if key in payload:
+            raw = payload.get(key)
+            break
+        if key in config:
+            raw = config.get(key)
+            break
+
+    values = _coerce_string_list(raw)
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = _clean_discord_id(value)
+        if not _DISCORD_SNOWFLAKE_RE.match(cleaned):
+            errors.append(
+                {
+                    "path": path,
+                    "message": f"{label} must be Discord numeric IDs.",
+                }
+            )
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+
+    if required and not normalized:
+        errors.append(
+            {
+                "path": path,
+                "message": f"At least one {label.lower()} entry is required.",
+            }
+        )
+
+    return normalized
+
+
+def _coerce_string_list(raw: Any) -> List[str]:
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(part).strip() for part in raw if str(part).strip()]
+    return []
+
+
 def _telegram_config_override(state: Dict[str, Any]) -> Dict[str, Any]:
     credentials = state.get("credentials") if isinstance(state, dict) else {}
     configuration = state.get("configuration") if isinstance(state, dict) else {}
@@ -447,6 +540,332 @@ def _telegram_config_override(state: Dict[str, Any]) -> Dict[str, Any]:
     return override
 
 
+def _validate_discord_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise PlatformValidationError(
+            DISCORD_PLATFORM_ID,
+            [{"path": "", "message": "Request body must be a JSON object."}],
+        )
+
+    errors: List[Dict[str, str]] = []
+    bot_token = _discord_bot_token_from_payload(payload, errors)
+    allowed_users = _discord_allowed_users_from_payload(payload, errors)
+    allowed_roles = _discord_snowflake_list_from_payload(
+        payload,
+        errors,
+        keys=("allowed_roles", "roles", "role_ids"),
+        path="allowed_roles",
+        label="Discord allowed role IDs",
+        required=False,
+    )
+    home_channel = _discord_home_channel_from_payload(payload, errors)
+    enabled_toolsets = _discord_toolsets_from_payload(payload)
+    allowed_channels = _discord_channel_list_from_payload(
+        payload,
+        "allowed_channels",
+        default_home_channel=home_channel,
+        errors=errors,
+    )
+    free_response_channels = _discord_channel_list_from_payload(
+        payload,
+        "free_response_channels",
+        default_home_channel=home_channel,
+        errors=errors,
+    )
+    require_mention = _bool_from_payload(payload, "require_mention", default=True)
+
+    if errors:
+        raise PlatformValidationError(DISCORD_PLATFORM_ID, errors)
+
+    configuration: Dict[str, Any] = {
+        "allowed_users": allowed_users,
+        "allowed_roles": allowed_roles,
+        "enabled_toolsets": enabled_toolsets,
+        "allowed_channels": allowed_channels,
+        "free_response_channels": free_response_channels,
+        "require_mention": require_mention,
+    }
+    if home_channel is not None:
+        configuration["home_channel"] = home_channel
+
+    return {
+        "version": RUNTIME_STATE_VERSION,
+        "platform": DISCORD_PLATFORM_ID,
+        "updated_at": _utc_now_iso(),
+        "credentials": {
+            "bot_token": bot_token,
+        },
+        "configuration": configuration,
+    }
+
+
+def _discord_bot_token_from_payload(
+    payload: Dict[str, Any],
+    errors: List[Dict[str, str]],
+) -> str:
+    credentials = _payload_credentials(payload)
+    raw = (
+        payload.get("bot_token")
+        or payload.get("token")
+        or credentials.get("bot_token")
+        or credentials.get("token")
+    )
+    if not isinstance(raw, str) or not raw.strip():
+        errors.append(
+            {"path": "bot_token", "message": "Discord bot token is required."}
+        )
+        return ""
+
+    token = raw.strip()
+    if not _DISCORD_TOKEN_RE.match(token):
+        errors.append(
+            {
+                "path": "bot_token",
+                "message": "Discord bot token must look like a bot token.",
+            }
+        )
+        return ""
+    return token
+
+
+def _discord_allowed_users_from_payload(
+    payload: Dict[str, Any],
+    errors: List[Dict[str, str]],
+) -> List[str]:
+    config = _payload_config(payload)
+    raw = payload.get("allowed_users", config.get("allowed_users"))
+    if raw is None:
+        raw = payload.get("allow_from", config.get("allow_from"))
+
+    if isinstance(raw, str):
+        values = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(part).strip() for part in raw]
+    else:
+        values = []
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        cleaned = _clean_discord_id(value)
+        if not _DISCORD_SNOWFLAKE_RE.match(cleaned):
+            errors.append(
+                {
+                    "path": "allowed_users",
+                    "message": "Discord allowed user IDs must be numeric Discord IDs.",
+                }
+            )
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+
+    if not normalized:
+        errors.append(
+            {
+                "path": "allowed_users",
+                "message": "At least one Discord allowed user ID is required.",
+            }
+        )
+
+    return normalized
+
+
+def _discord_home_channel_from_payload(
+    payload: Dict[str, Any],
+    errors: List[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    config = _payload_config(payload)
+    raw = payload.get("home_channel", config.get("home_channel"))
+
+    if raw is None or raw == "":
+        return None
+
+    if isinstance(raw, dict):
+        chat_id = raw.get("chat_id") or raw.get("id")
+        name = raw.get("name") or "Home"
+        thread_id = raw.get("thread_id")
+    else:
+        chat_id = raw
+        name = "Home"
+        thread_id = None
+
+    chat_id_text = _clean_discord_id(str(chat_id).strip() if chat_id is not None else "")
+    if not chat_id_text:
+        return None
+
+    if not _DISCORD_SNOWFLAKE_RE.match(chat_id_text):
+        errors.append(
+            {
+                "path": "home_channel",
+                "message": "Discord home channel must be a numeric Discord channel ID.",
+            }
+        )
+
+    result = {
+        "platform": DISCORD_PLATFORM_ID,
+        "chat_id": chat_id_text,
+        "name": str(name or "Home"),
+    }
+    if thread_id is not None and str(thread_id).strip():
+        thread_id_text = _clean_discord_id(str(thread_id).strip())
+        if not _DISCORD_SNOWFLAKE_RE.match(thread_id_text):
+            errors.append(
+                {
+                    "path": "home_channel.thread_id",
+                    "message": "Discord home channel thread ID must be numeric.",
+                }
+            )
+        else:
+            result["thread_id"] = thread_id_text
+    return result
+
+
+def _discord_toolsets_from_payload(payload: Dict[str, Any]) -> List[str]:
+    config = _payload_config(payload)
+    raw = (
+        payload.get("enabled_toolsets")
+        or payload.get("toolsets")
+        or config.get("enabled_toolsets")
+        or config.get("toolsets")
+    )
+    if isinstance(raw, str):
+        candidates = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = [str(part).strip() for part in raw]
+    else:
+        candidates = list(_DISCORD_DEFAULT_TOOLSETS)
+
+    allowed = set(_DISCORD_DEFAULT_TOOLSETS)
+    normalized = [item for item in candidates if item in allowed]
+    if not normalized:
+        return list(_DISCORD_DEFAULT_TOOLSETS)
+
+    result: List[str] = []
+    for item in normalized:
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def _discord_channel_list_from_payload(
+    payload: Dict[str, Any],
+    key: str,
+    *,
+    default_home_channel: Optional[Dict[str, str]],
+    errors: List[Dict[str, str]],
+) -> List[str]:
+    config = _payload_config(payload)
+    raw = payload.get(key, config.get(key))
+    if raw is None:
+        if default_home_channel and default_home_channel.get("chat_id"):
+            return [default_home_channel["chat_id"]]
+        return []
+
+    if isinstance(raw, str):
+        values = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(part).strip() for part in raw]
+    else:
+        values = []
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        cleaned = _clean_discord_id(value)
+        if not _DISCORD_SNOWFLAKE_RE.match(cleaned):
+            errors.append(
+                {
+                    "path": key,
+                    "message": f"Discord {key} values must be numeric channel IDs.",
+                }
+            )
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+    return normalized
+
+
+def _bool_from_payload(
+    payload: Dict[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    config = _payload_config(payload)
+    raw = payload.get(key, config.get(key, default))
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return default
+
+
+def _clean_discord_id(value: str) -> str:
+    text = value.strip()
+    for prefix, suffix in (("<@", ">"), ("<@!", ">"), ("<#", ">")):
+        if text.startswith(prefix) and text.endswith(suffix):
+            return text[len(prefix):-len(suffix)].strip()
+    return text
+
+
+def _discord_config_override(state: Dict[str, Any]) -> Dict[str, Any]:
+    credentials = state.get("credentials") if isinstance(state, dict) else {}
+    configuration = state.get("configuration") if isinstance(state, dict) else {}
+    token = credentials.get("bot_token") if isinstance(credentials, dict) else None
+    allowed_users = (
+        configuration.get("allowed_users") if isinstance(configuration, dict) else []
+    )
+    allowed_roles = (
+        configuration.get("allowed_roles") if isinstance(configuration, dict) else []
+    )
+    home_channel = (
+        configuration.get("home_channel") if isinstance(configuration, dict) else None
+    )
+    allowed_channels = (
+        configuration.get("allowed_channels") if isinstance(configuration, dict) else []
+    )
+    free_response_channels = (
+        configuration.get("free_response_channels")
+        if isinstance(configuration, dict)
+        else []
+    )
+
+    extra: Dict[str, Any] = {}
+    if isinstance(allowed_users, list):
+        extra["allow_from"] = [str(value) for value in allowed_users]
+        extra["allowed_users"] = [str(value) for value in allowed_users]
+    if isinstance(allowed_roles, list) and allowed_roles:
+        extra["allowed_roles"] = [str(value) for value in allowed_roles]
+    if isinstance(allowed_channels, list) and allowed_channels:
+        extra["allowed_channels"] = [str(value) for value in allowed_channels]
+    if isinstance(free_response_channels, list) and free_response_channels:
+        extra["free_response_channels"] = [
+            str(value) for value in free_response_channels
+        ]
+    if isinstance(configuration, dict) and "require_mention" in configuration:
+        extra["require_mention"] = bool(configuration["require_mention"])
+
+    override: Dict[str, Any] = {
+        "enabled": bool(token),
+        "extra": extra,
+    }
+    if isinstance(token, str) and token:
+        override["token"] = token
+    if isinstance(home_channel, dict) and home_channel.get("chat_id"):
+        override["home_channel"] = dict(home_channel)
+    return override
+
+
 def _apply_platform_env(
     platform: str,
     state: Dict[str, Any],
@@ -454,46 +873,112 @@ def _apply_platform_env(
     overwrite: bool,
     include_token: bool = True,
 ) -> None:
-    if platform != TELEGRAM_PLATFORM_ID:
-        return
-
     configuration = state.get("configuration") if isinstance(state, dict) else {}
     credentials = state.get("credentials") if isinstance(state, dict) else {}
     allowed_users = (
         configuration.get("allowed_users") if isinstance(configuration, dict) else []
+    )
+    allowed_roles = (
+        configuration.get("allowed_roles") if isinstance(configuration, dict) else []
     )
     home_channel = (
         configuration.get("home_channel") if isinstance(configuration, dict) else {}
     )
     token = credentials.get("bot_token") if isinstance(credentials, dict) else None
 
-    _set_env("TELEGRAM_ALLOWED_USERS", ",".join(str(v) for v in allowed_users), overwrite)
+    if platform == TELEGRAM_PLATFORM_ID:
+        prefix = "TELEGRAM"
+    elif platform == DISCORD_PLATFORM_ID:
+        prefix = "DISCORD"
+    else:
+        return
+
+    _set_env(f"{prefix}_ALLOWED_USERS", ",".join(str(v) for v in allowed_users), overwrite)
+    if platform == DISCORD_PLATFORM_ID and isinstance(configuration, dict):
+        if isinstance(allowed_roles, list):
+            _set_env(
+                "DISCORD_ALLOWED_ROLES",
+                ",".join(str(v) for v in allowed_roles),
+                overwrite,
+            )
+        allowed_channels = configuration.get("allowed_channels")
+        free_response_channels = configuration.get("free_response_channels")
+        if isinstance(allowed_channels, list):
+            _set_env(
+                "DISCORD_ALLOWED_CHANNELS",
+                ",".join(str(v) for v in allowed_channels),
+                overwrite,
+            )
+        if isinstance(free_response_channels, list):
+            _set_env(
+                "DISCORD_FREE_RESPONSE_CHANNELS",
+                ",".join(str(v) for v in free_response_channels),
+                overwrite,
+            )
+        if "require_mention" in configuration:
+            _set_env(
+                "DISCORD_REQUIRE_MENTION",
+                str(bool(configuration["require_mention"])).lower(),
+                overwrite,
+            )
     if isinstance(home_channel, dict):
-        _set_env("TELEGRAM_HOME_CHANNEL", str(home_channel.get("chat_id") or ""), overwrite)
+        _set_env(f"{prefix}_HOME_CHANNEL", str(home_channel.get("chat_id") or ""), overwrite)
         if home_channel.get("name"):
             _set_env(
-                "TELEGRAM_HOME_CHANNEL_NAME",
+                f"{prefix}_HOME_CHANNEL_NAME",
                 str(home_channel.get("name") or "Home"),
                 overwrite,
             )
-        if home_channel.get("thread_id"):
-            _set_env(
-                "TELEGRAM_HOME_CHANNEL_THREAD_ID",
-                str(home_channel.get("thread_id") or ""),
-                overwrite,
-            )
+        _set_env(
+            f"{prefix}_HOME_CHANNEL_THREAD_ID",
+            str(home_channel.get("thread_id") or ""),
+            overwrite,
+        )
+    elif overwrite:
+        _set_env(f"{prefix}_HOME_CHANNEL", "", overwrite)
+        _set_env(f"{prefix}_HOME_CHANNEL_NAME", "", overwrite)
+        _set_env(f"{prefix}_HOME_CHANNEL_THREAD_ID", "", overwrite)
     if include_token and isinstance(token, str):
-        _set_env("TELEGRAM_BOT_TOKEN", token, overwrite)
+        _set_env(f"{prefix}_BOT_TOKEN", token, overwrite)
 
 
 def _set_env(key: str, value: str, overwrite: bool) -> None:
     if not value:
+        if overwrite:
+            os.environ.pop(key, None)
         return
     if overwrite or not os.getenv(key):
         os.environ[key] = value
 
 
 async def _hot_apply_telegram(state: Dict[str, Any], runner: Any) -> Dict[str, Any]:
+    return await _hot_apply_platform(
+        state,
+        runner,
+        platform_id=TELEGRAM_PLATFORM_ID,
+        label="Telegram",
+        configure_platform_config=_configure_telegram_platform_config,
+    )
+
+
+async def _hot_apply_discord(state: Dict[str, Any], runner: Any) -> Dict[str, Any]:
+    return await _hot_apply_platform(
+        state,
+        runner,
+        platform_id=DISCORD_PLATFORM_ID,
+        label="Discord",
+        configure_platform_config=_configure_discord_platform_config,
+    )
+
+
+async def _hot_apply_platform(
+    state: Dict[str, Any],
+    runner: Any,
+    *,
+    platform_id: str,
+    label: str,
+    configure_platform_config: Any,
+) -> Dict[str, Any]:
     required_attrs = ("config", "adapters", "_create_adapter")
     if not all(hasattr(runner, attr) for attr in required_attrs):
         return _restart_required_result("Gateway runner does not expose hot-apply hooks.")
@@ -501,32 +986,24 @@ async def _hot_apply_telegram(state: Dict[str, Any], runner: Any) -> Dict[str, A
     try:
         from gateway.config import HomeChannel, Platform, PlatformConfig
 
-        platform = Platform.TELEGRAM
+        platform = Platform(platform_id)
         platform_config = runner.config.platforms.get(platform)
         if platform_config is None:
             platform_config = PlatformConfig()
             runner.config.platforms[platform] = platform_config
 
-        configuration = state["configuration"]
         credentials = state["credentials"]
-
-        # Apply non-secret gates before enabling the token-backed adapter.
-        platform_config.extra = dict(platform_config.extra or {})
-        platform_config.extra["allow_from"] = list(configuration["allowed_users"])
-        platform_config.extra["allowed_users"] = list(configuration["allowed_users"])
-        platform_config.home_channel = HomeChannel.from_dict(
-            dict(configuration["home_channel"])
-        )
         _apply_platform_env(
-            TELEGRAM_PLATFORM_ID,
+            platform_id,
             state,
             overwrite=True,
             include_token=False,
         )
+        configure_platform_config(platform_config, state, HomeChannel)
 
         platform_config.enabled = True
         platform_config.token = credentials["bot_token"]
-        _apply_platform_env(TELEGRAM_PLATFORM_ID, state, overwrite=True)
+        _apply_platform_env(platform_id, state, overwrite=True)
 
         existing = runner.adapters.get(platform)
         if existing is not None:
@@ -550,21 +1027,21 @@ async def _hot_apply_telegram(state: Dict[str, Any], runner: Any) -> Dict[str, A
                 platform.value,
                 state="startup_failed",
                 error_code="adapter_unavailable",
-                error_message="Telegram adapter could not be created.",
+                error_message=f"{label} adapter could not be created.",
             )
             return {
                 "applied": False,
                 "restart_required": False,
                 "state": "startup_failed",
                 "error_code": "adapter_unavailable",
-                "error_message": "Telegram adapter could not be created.",
+                "error_message": f"{label} adapter could not be created.",
             }
 
         _wire_adapter(runner, adapter)
         success = await _connect_adapter(runner, adapter, platform)
         if success:
             runner.adapters[platform] = adapter
-            _sync_runner_delivery_router(runner)
+            _sync_runner_delivery_router(runner, platform_id)
             _update_platform_runtime_status(
                 runner,
                 platform.value,
@@ -585,7 +1062,7 @@ async def _hot_apply_telegram(state: Dict[str, Any], runner: Any) -> Dict[str, A
         error_message = _redact_state_secrets(
             state,
             getattr(adapter, "fatal_error_message", None)
-            or "Telegram adapter failed to connect."
+            or f"{label} adapter failed to connect.",
         )
         state_name = (
             "fatal"
@@ -610,11 +1087,11 @@ async def _hot_apply_telegram(state: Dict[str, Any], runner: Any) -> Dict[str, A
     except Exception as exc:
         error_message = _redact_state_secrets(
             state,
-            str(exc) or "Telegram platform apply failed.",
+            str(exc) or f"{label} platform apply failed.",
         )
         _update_platform_runtime_status(
             runner,
-            TELEGRAM_PLATFORM_ID,
+            platform_id,
             state="startup_failed",
             error_code="platform_apply_failed",
             error_message=error_message,
@@ -626,6 +1103,48 @@ async def _hot_apply_telegram(state: Dict[str, Any], runner: Any) -> Dict[str, A
             "error_code": "platform_apply_failed",
             "error_message": error_message,
         }
+
+
+def _configure_telegram_platform_config(
+    platform_config: Any,
+    state: Dict[str, Any],
+    HomeChannel: Any,
+) -> None:
+    configuration = state["configuration"]
+    platform_config.extra = dict(platform_config.extra or {})
+    platform_config.extra["allow_from"] = list(configuration["allowed_users"])
+    platform_config.extra["allowed_users"] = list(configuration["allowed_users"])
+    platform_config.home_channel = HomeChannel.from_dict(
+        dict(configuration["home_channel"])
+    )
+
+
+def _configure_discord_platform_config(
+    platform_config: Any,
+    state: Dict[str, Any],
+    HomeChannel: Any,
+) -> None:
+    configuration = state["configuration"]
+    platform_config.extra = dict(platform_config.extra or {})
+    platform_config.extra["allow_from"] = list(configuration["allowed_users"])
+    platform_config.extra["allowed_users"] = list(configuration["allowed_users"])
+    platform_config.extra["allowed_roles"] = list(
+        configuration.get("allowed_roles") or []
+    )
+    platform_config.extra["allowed_channels"] = list(
+        configuration.get("allowed_channels") or []
+    )
+    platform_config.extra["free_response_channels"] = list(
+        configuration.get("free_response_channels") or []
+    )
+    platform_config.extra["require_mention"] = bool(
+        configuration.get("require_mention", True)
+    )
+    home_channel = configuration.get("home_channel")
+    if isinstance(home_channel, dict) and home_channel.get("chat_id"):
+        platform_config.home_channel = HomeChannel.from_dict(dict(home_channel))
+    else:
+        platform_config.home_channel = None
 
 
 def _restart_required_result(message: str) -> Dict[str, Any]:
@@ -663,9 +1182,12 @@ async def _connect_adapter(runner: Any, adapter: Any, platform: Any) -> bool:
     return bool(result)
 
 
-def _sync_runner_delivery_router(runner: Any) -> None:
+def _sync_runner_delivery_router(
+    runner: Any,
+    platform_id: str = TELEGRAM_PLATFORM_ID,
+) -> None:
     sync_voice = getattr(runner, "_sync_voice_mode_state_to_adapter", None)
-    platform = _platform_enum(TELEGRAM_PLATFORM_ID)
+    platform = _platform_enum(platform_id)
     if sync_voice is not None and platform is not None:
         adapter = runner.adapters.get(platform)
         if adapter is not None:
@@ -754,6 +1276,51 @@ def _telegram_status(
         "connected": state == "connected",
         "credential_fingerprint": _secret_fingerprint(token),
         "allowed_users": allowed_users,
+        "home_channel": home_channel,
+        "error_code": runtime.get("error_code") if runtime else None,
+        "error_message": _redact_state_secrets(
+            persisted_state,
+            runtime.get("error_message") if runtime else None,
+            fallback_secrets=[token],
+        ),
+        "updated_at": runtime.get("updated_at") if runtime else _state_updated_at(persisted_state),
+        "capabilities": {
+            "configure": True,
+            "hot_apply": True,
+        },
+    }
+
+
+def _discord_status(
+    *,
+    runner: Any = None,
+    persisted_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    persisted_state = persisted_state or _read_platform_state(DISCORD_PLATFORM_ID)
+    runtime = _runtime_platform_status(DISCORD_PLATFORM_ID)
+    runner_config = _runner_platform_config(runner, DISCORD_PLATFORM_ID)
+
+    token = _discord_token_for_status(persisted_state, runner_config)
+    allowed_users = _discord_allowed_users_for_status(persisted_state, runner_config)
+    allowed_roles = _discord_allowed_roles_for_status(persisted_state, runner_config)
+    home_channel = _discord_home_channel_for_status(persisted_state, runner_config)
+
+    state = runtime.get("state") if runtime else None
+    if _runner_platform_connected(runner, DISCORD_PLATFORM_ID):
+        state = "connected"
+    if not state:
+        state = "disconnected"
+
+    return {
+        "id": DISCORD_PLATFORM_ID,
+        "name": "Discord",
+        "supported": True,
+        "configured": bool(token),
+        "state": state,
+        "connected": state == "connected",
+        "credential_fingerprint": _secret_fingerprint(token),
+        "allowed_users": allowed_users,
+        "allowed_roles": allowed_roles,
         "home_channel": home_channel,
         "error_code": runtime.get("error_code") if runtime else None,
         "error_message": _redact_state_secrets(
@@ -892,9 +1459,115 @@ def _telegram_home_channel_for_status(
     return None
 
 
-def _public_home_channel(home: Dict[str, Any]) -> Dict[str, Any]:
+def _discord_token_for_status(
+    state: Optional[Dict[str, Any]],
+    platform_config: Any,
+) -> str:
+    config_token = getattr(platform_config, "token", None)
+    if isinstance(config_token, str) and config_token:
+        return config_token
+    env_token = os.getenv("DISCORD_BOT_TOKEN", "")
+    if env_token:
+        return env_token
+    credentials = state.get("credentials") if isinstance(state, dict) else {}
+    token = credentials.get("bot_token") if isinstance(credentials, dict) else None
+    if isinstance(token, str) and token:
+        return token
+    return ""
+
+
+def _discord_allowed_users_for_status(
+    state: Optional[Dict[str, Any]],
+    platform_config: Any,
+) -> List[str]:
+    env_allowed = os.getenv("DISCORD_ALLOWED_USERS", "")
+    if env_allowed:
+        return [part.strip() for part in env_allowed.split(",") if part.strip()]
+
+    allowed = None
+    if platform_config is not None:
+        extra = getattr(platform_config, "extra", None) or {}
+        if isinstance(extra, dict):
+            allowed = extra.get("allow_from") or extra.get("allowed_users")
+    if allowed is None:
+        configuration = state.get("configuration") if isinstance(state, dict) else {}
+        allowed = (
+            configuration.get("allowed_users") if isinstance(configuration, dict) else None
+        )
+    if isinstance(allowed, str):
+        return [part.strip() for part in allowed.split(",") if part.strip()]
+    if isinstance(allowed, (list, tuple, set)):
+        return [str(part).strip() for part in allowed if str(part).strip()]
+    return []
+
+
+def _discord_allowed_roles_for_status(
+    state: Optional[Dict[str, Any]],
+    platform_config: Any,
+) -> List[str]:
+    env_allowed = os.getenv("DISCORD_ALLOWED_ROLES", "")
+    if env_allowed:
+        return [part.strip() for part in env_allowed.split(",") if part.strip()]
+
+    allowed = None
+    if platform_config is not None:
+        extra = getattr(platform_config, "extra", None) or {}
+        if isinstance(extra, dict):
+            allowed = extra.get("allowed_roles")
+    if allowed is None:
+        configuration = state.get("configuration") if isinstance(state, dict) else {}
+        allowed = (
+            configuration.get("allowed_roles") if isinstance(configuration, dict) else None
+        )
+    if isinstance(allowed, str):
+        return [part.strip() for part in allowed.split(",") if part.strip()]
+    if isinstance(allowed, (list, tuple, set)):
+        return [str(part).strip() for part in allowed if str(part).strip()]
+    return []
+
+
+def _discord_home_channel_for_status(
+    state: Optional[Dict[str, Any]],
+    platform_config: Any,
+) -> Optional[Dict[str, Any]]:
+    env_home = os.getenv("DISCORD_HOME_CHANNEL")
+    if env_home:
+        home = {
+            "platform": DISCORD_PLATFORM_ID,
+            "chat_id": env_home,
+            "name": os.getenv("DISCORD_HOME_CHANNEL_NAME", "Home"),
+        }
+        thread_id = os.getenv("DISCORD_HOME_CHANNEL_THREAD_ID")
+        if thread_id:
+            home["thread_id"] = thread_id
+        return _public_home_channel(home, default_platform=DISCORD_PLATFORM_ID)
+
+    config_home = getattr(platform_config, "home_channel", None)
+    if config_home is not None:
+        to_dict = getattr(config_home, "to_dict", None)
+        if to_dict is not None:
+            try:
+                return _public_home_channel(
+                    to_dict(),
+                    default_platform=DISCORD_PLATFORM_ID,
+                )
+            except Exception:
+                pass
+
+    configuration = state.get("configuration") if isinstance(state, dict) else {}
+    home = configuration.get("home_channel") if isinstance(configuration, dict) else None
+    if isinstance(home, dict) and home.get("chat_id"):
+        return _public_home_channel(home, default_platform=DISCORD_PLATFORM_ID)
+    return None
+
+
+def _public_home_channel(
+    home: Dict[str, Any],
+    *,
+    default_platform: str = TELEGRAM_PLATFORM_ID,
+) -> Dict[str, Any]:
     result = {
-        "platform": str(home.get("platform") or TELEGRAM_PLATFORM_ID),
+        "platform": str(home.get("platform") or default_platform),
         "chat_id": str(home.get("chat_id") or ""),
         "name": str(home.get("name") or "Home"),
     }
