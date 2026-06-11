@@ -9,9 +9,12 @@ from typing import Any, Dict, List, Optional
 
 CODEX_PROVIDER_ID = "openai-codex"
 ANTHROPIC_PROVIDER_ID = "anthropic"
+GEMINI_PROVIDER_ID = "gemini"
 OPENROUTER_PROVIDER_ID = "openrouter"
 ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 ANTHROPIC_TOKEN_ENV = "ANTHROPIC_TOKEN"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 TRYAGENT_MANAGED_OPENROUTER_API_KEY_ENV = "TRYAGENT_MANAGED_OPENROUTER_API_KEY"
 TRYAGENT_OPENROUTER_CONNECTION_KIND_ENV = "TRYAGENT_OPENROUTER_CONNECTION_KIND"
@@ -25,6 +28,7 @@ def list_providers() -> Dict[str, Any]:
         "providers": [
             _provider_status(CODEX_PROVIDER_ID, policy),
             _provider_status(ANTHROPIC_PROVIDER_ID, policy),
+            _provider_status(GEMINI_PROVIDER_ID, policy),
             _provider_status(OPENROUTER_PROVIDER_ID, policy),
         ]
     }
@@ -33,7 +37,11 @@ def list_providers() -> Dict[str, Any]:
 def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
     """Persist an API-key provider credential without exposing it in responses."""
     provider = _normalize_provider(provider_id)
-    if provider not in {ANTHROPIC_PROVIDER_ID, OPENROUTER_PROVIDER_ID}:
+    if provider not in {
+        ANTHROPIC_PROVIDER_ID,
+        GEMINI_PROVIDER_ID,
+        OPENROUTER_PROVIDER_ID,
+    }:
         raise ValueError(f"Unsupported API-key provider connect: {provider_id}")
 
     if not isinstance(api_key, str):
@@ -47,6 +55,8 @@ def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
 
     if provider == ANTHROPIC_PROVIDER_ID:
         _save_anthropic_api_key(key)
+    elif provider == GEMINI_PROVIDER_ID:
+        _save_env_value(GEMINI_API_KEY_ENV, key)
     else:
         current_key = _openrouter_api_key()
         current_kind = _openrouter_connection_kind()
@@ -74,7 +84,12 @@ def connect_provider_api_key(provider_id: str, api_key: Any) -> Dict[str, Any]:
 def disconnect_provider(provider_id: str) -> Dict[str, Any]:
     """Clear provider credentials without mutating the active model policy."""
     provider = _normalize_provider(provider_id)
-    if provider not in {ANTHROPIC_PROVIDER_ID, CODEX_PROVIDER_ID, OPENROUTER_PROVIDER_ID}:
+    if provider not in {
+        ANTHROPIC_PROVIDER_ID,
+        CODEX_PROVIDER_ID,
+        GEMINI_PROVIDER_ID,
+        OPENROUTER_PROVIDER_ID,
+    }:
         raise ValueError(f"Unsupported provider disconnect: {provider_id}")
 
     policy = get_model_policy()
@@ -99,6 +114,17 @@ def disconnect_provider(provider_id: str) -> Dict[str, Any]:
     if provider == ANTHROPIC_PROVIDER_ID:
         credential_removed = _remove_env_value(ANTHROPIC_API_KEY_ENV)
         credential_removed = _remove_env_value(ANTHROPIC_TOKEN_ENV) or credential_removed
+        return {
+            "ok": True,
+            "disconnected": True,
+            "credential_removed": credential_removed,
+            "provider": provider,
+            "active_policy_affected": active_policy_affected,
+        }
+
+    if provider == GEMINI_PROVIDER_ID:
+        credential_removed = _remove_env_value(GEMINI_API_KEY_ENV)
+        credential_removed = _remove_env_value(GOOGLE_API_KEY_ENV) or credential_removed
         return {
             "ok": True,
             "disconnected": True,
@@ -250,6 +276,8 @@ def _provider_status(provider: str, policy: Dict[str, Any]) -> Dict[str, Any]:
         return _codex_status(policy)
     if provider == ANTHROPIC_PROVIDER_ID:
         return _anthropic_status(policy)
+    if provider == GEMINI_PROVIDER_ID:
+        return _gemini_status(policy)
     if provider == OPENROUTER_PROVIDER_ID:
         return _openrouter_status(policy)
     raise ValueError(f"Unsupported provider: {provider}")
@@ -297,6 +325,23 @@ def _anthropic_status(policy: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _gemini_status(policy: Dict[str, Any]) -> Dict[str, Any]:
+    token = _gemini_api_key()
+    connected = bool(token)
+    return {
+        "id": GEMINI_PROVIDER_ID,
+        "name": "Gemini",
+        "connection_kind": "api_key",
+        "status": "connected" if connected else "disconnected",
+        "connected": connected,
+        "credential_fingerprint": _secret_fingerprint(token),
+        "last_error_message": None,
+        "active_policy": _policy_mentions_provider(policy, GEMINI_PROVIDER_ID),
+        "oauth": None,
+        "model_policy": True,
+    }
+
+
 def _openrouter_status(policy: Dict[str, Any]) -> Dict[str, Any]:
     token = _openrouter_api_key()
     connected = bool(token)
@@ -337,6 +382,19 @@ def _anthropic_api_key() -> str:
     except Exception:
         pass
     return os.getenv(ANTHROPIC_API_KEY_ENV, "") or os.getenv(ANTHROPIC_TOKEN_ENV, "")
+
+
+def _gemini_api_key() -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        for key in (GEMINI_API_KEY_ENV, GOOGLE_API_KEY_ENV):
+            value = get_env_value(key)
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return os.getenv(GEMINI_API_KEY_ENV, "") or os.getenv(GOOGLE_API_KEY_ENV, "")
 
 
 def _save_anthropic_api_key(value: str) -> None:

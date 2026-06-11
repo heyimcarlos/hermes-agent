@@ -29,10 +29,14 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
                     "connect": "/api/providers/anthropic/api-key",
                     "disconnect": "/api/providers/anthropic",
                 },
+                "gemini": {
+                    "connect": "/api/providers/gemini/api-key",
+                    "disconnect": "/api/providers/gemini",
+                },
                 "openrouter": {
                     "connect": "/api/providers/openrouter/api-key",
                     "disconnect": "/api/providers/openrouter",
-                }
+                },
             },
             "provider_oauth": {
                 "openai-codex": {
@@ -95,6 +99,10 @@ def provider_control_capabilities() -> Dict[str, Dict[str, Any]]:
             "provider_api_key_anthropic_connect": {
                 "method": "POST",
                 "path": "/api/providers/anthropic/api-key",
+            },
+            "provider_api_key_gemini_connect": {
+                "method": "POST",
+                "path": "/api/providers/gemini/api-key",
             },
         },
     }
