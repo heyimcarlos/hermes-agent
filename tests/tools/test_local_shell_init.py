@@ -7,6 +7,7 @@ tests verify the config-driven prelude that fixes that.
 """
 
 import os
+import shutil
 from unittest.mock import patch
 
 import pytest
@@ -310,3 +311,50 @@ class TestSnapshotEndToEnd:
         assert str(fake_n_bin) in output
         # bashrc short-circuited on the interactive guard — its export never ran
         assert "FROM_BASHRC=bashrc-should-not-appear" not in output
+
+    def test_snapshot_preserves_entrypoint_virtualenv_after_login_path_reset(
+        self, tmp_path, monkeypatch
+    ):
+        """Hosted containers activate Hermes' venv before Gateway starts.
+
+        A later login-shell snapshot can reset PATH through /etc/profile,
+        leaving VIRTUAL_ENV set but hiding the venv console scripts. Reproduce
+        that with a fake bash wrapper that clobbers PATH for -l invocations.
+        """
+        real_bash = shutil.which("bash")
+        if not real_bash:
+            pytest.skip("requires bash")
+
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        hermes = venv_bin / "hermes"
+        hermes.write_text("#!/bin/sh\necho venv-hermes\n")
+        hermes.chmod(0o755)
+
+        fake_bash = tmp_path / "fake-bash"
+        fake_bash.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-l" ]; then\n'
+            "  shift\n"
+            '  export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"\n'
+            f"  exec {real_bash} \"$@\"\n"
+            "fi\n"
+            f"exec {real_bash} \"$@\"\n"
+        )
+        fake_bash.chmod(0o755)
+
+        monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "venv"))
+        monkeypatch.setenv("PATH", f"{venv_bin}:{os.environ.get('PATH', '')}")
+
+        with patch("tools.environments.local._find_bash", return_value=str(fake_bash)):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                snapshot = open(env._snapshot_path, encoding="utf-8").read()
+                result = env.execute('command -v hermes; hermes')
+            finally:
+                env.cleanup()
+
+        assert f"{venv_bin}:" in snapshot
+        assert result["returncode"] == 0
+        assert str(venv_bin / "hermes") in result["output"]
+        assert "venv-hermes" in result["output"]
