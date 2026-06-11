@@ -1017,6 +1017,7 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_config = runtime_policy["reasoning_config"]
         model = runtime_policy["model"]
         user_config = runtime_policy["user_config"]
+        provider_routing = runtime_policy["provider_routing"]
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -1040,6 +1041,14 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            providers_allowed=provider_routing.get("only"),
+            providers_ignored=provider_routing.get("ignore"),
+            providers_order=provider_routing.get("order"),
+            provider_sort=provider_routing.get("sort"),
+            provider_require_parameters=provider_routing.get(
+                "require_parameters", False
+            ),
+            provider_data_collection=provider_routing.get("data_collection"),
             gateway_session_key=gateway_session_key,
         )
         return agent

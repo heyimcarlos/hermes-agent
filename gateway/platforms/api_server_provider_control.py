@@ -264,8 +264,8 @@ async def _handle_model_policy_activate(adapter: Any, request: Any) -> Any:
                     status=400,
                 )
 
-            await _refresh_runtime_model_policy(adapter)
             try:
+                await _refresh_runtime_model_policy(adapter)
                 smoke = await _smoke_model_policy(adapter)
             except Exception as exc:
                 restored = False
@@ -276,13 +276,13 @@ async def _handle_model_policy_activate(adapter: Any, request: Any) -> Any:
                         restore_model_policy_config,
                         previous_config,
                     )
-                    await _refresh_runtime_model_policy(adapter)
                     restored = True
-                except Exception as rollback_exc:  # pragma: no cover
+                    await _refresh_runtime_model_policy(adapter)
+                except Exception as rollback_exc:
                     logger.exception("model policy rollback failed")
                     restore_error = str(rollback_exc) or "Model policy rollback failed"
 
-                logger.warning("model policy activation smoke failed: %s", exc)
+                logger.warning("model policy activation failed after apply: %s", exc)
                 response = {
                     "ok": False,
                     "activated": False,
@@ -295,12 +295,12 @@ async def _handle_model_policy_activate(adapter: Any, request: Any) -> Any:
                     "restored": restored,
                     "smoke": {
                         "ok": False,
-                        "error": str(exc) or "Model policy smoke failed",
+                        "error": str(exc) or "Model policy activation failed",
                     },
                 }
                 if restore_error:
                     response["restore_error"] = restore_error
-                return _json_response(response, status=409 if restored else 500)
+                return _json_response(response, status=500 if restore_error else 409)
 
             return _json_response(
                 {
