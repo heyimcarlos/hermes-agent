@@ -18,9 +18,11 @@ import os
 import stat
 import time
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -35,6 +37,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_provider_control import register_provider_control_routes
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +615,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    register_provider_control_routes(app, adapter)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -904,6 +908,314 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+
+# ---------------------------------------------------------------------------
+# Provider OAuth endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestProviderOAuthEndpoint:
+    @pytest.mark.asyncio
+    async def test_codex_start_requires_auth_when_key_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/providers/oauth/openai-codex/start")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_codex_start_returns_device_code_payload(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.provider_oauth.start_codex_device_login",
+            lambda: {
+                "session_id": "session-1",
+                "flow": "device_code",
+                "user_code": "ABCD-1234",
+                "verification_url": "https://auth.openai.com/codex/device",
+                "verification_uri": "https://auth.openai.com/codex/device",
+                "verification_url_complete": "https://auth.openai.com/codex/device",
+                "verification_uri_complete": "https://auth.openai.com/codex/device",
+                "expires_in": 900,
+                "poll_interval": 5,
+                "interval": 5,
+            },
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/oauth/openai-codex/start",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["session_id"] == "session-1"
+            assert data["user_code"] == "ABCD-1234"
+            assert data["verification_url"] == "https://auth.openai.com/codex/device"
+
+    @pytest.mark.asyncio
+    async def test_codex_poll_returns_non_secret_status(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.provider_oauth.poll_codex_device_login",
+            lambda session_id: {
+                "session_id": session_id,
+                "status": "approved",
+                "message": None,
+                "error_message": None,
+                "credential_fingerprint": "sha256:9e0a7f2a5c4f8b21",
+                "token_preview": "sha256:9e0a7f2a5c4f8b21",
+                "expires_at": None,
+            },
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/providers/oauth/openai-codex/poll/session-1",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "session_id": "session-1",
+                "status": "approved",
+                "message": None,
+                "error_message": None,
+                "credential_fingerprint": "sha256:9e0a7f2a5c4f8b21",
+                "token_preview": "sha256:9e0a7f2a5c4f8b21",
+                "expires_at": None,
+            }
+
+    @pytest.mark.asyncio
+    async def test_codex_disconnect_clears_provider(self, auth_adapter, monkeypatch):
+        called = {}
+
+        def _disconnect():
+            called["disconnect"] = True
+            return True
+
+        monkeypatch.setattr("hermes_cli.provider_oauth.disconnect_codex", _disconnect)
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete(
+                "/api/providers/openai-codex",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "ok": True,
+                "disconnected": True,
+                "credential_removed": True,
+                "provider": "openai-codex",
+                "active_policy_affected": False,
+            }
+            assert called["disconnect"] is True
+
+    @pytest.mark.asyncio
+    async def test_legacy_codex_disconnect_alias_still_works(self, auth_adapter, monkeypatch):
+        monkeypatch.setattr("hermes_cli.provider_oauth.disconnect_codex", lambda: True)
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.delete(
+                "/api/providers/oauth/openai-codex",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["provider"] == "openai-codex"
+            assert data["disconnected"] is True
+
+    @pytest.mark.asyncio
+    async def test_unsupported_provider_returns_400(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/providers/oauth/anthropic/start",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_provider_routes_exist_for_options_probe(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for path in (
+                "/api/providers/oauth/openai-codex/start",
+                "/api/providers/oauth/openai-codex/poll/session-1",
+                "/api/providers/openai-codex",
+                "/api/providers/oauth/openai-codex",
+            ):
+                resp = await cli.options(path)
+                assert resp.status in {200, 204, 403, 405}
+
+
+# ---------------------------------------------------------------------------
+# Provider status and model policy endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestProviderControlEndpoints:
+    @pytest.mark.asyncio
+    async def test_list_providers_returns_non_secret_status(self, auth_adapter, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+        monkeypatch.setattr(
+            "hermes_cli.auth.get_codex_auth_status",
+            lambda: {
+                "logged_in": True,
+                "api_key": "codex-secret-token",
+                "source": "pool:test",
+            },
+        )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/providers",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        providers = {item["id"]: item for item in data["providers"]}
+        assert providers["openai-codex"]["status"] == "connected"
+        assert providers["openai-codex"]["oauth"]["flow"] == "device_code"
+        assert providers["openai-codex"]["credential_fingerprint"].startswith("sha256:")
+        assert providers["openrouter"]["status"] == "connected"
+        assert "codex-secret-token" not in str(data)
+        assert "openrouter-secret" not in str(data)
+
+    @pytest.mark.asyncio
+    async def test_model_policy_reads_primary_and_fallbacks(self, auth_adapter):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        config_path.write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.3-codex\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: deepseek/deepseek-chat\n",
+            encoding="utf-8",
+        )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/model-policy",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["primary"] == {
+            "provider": "openai-codex",
+            "model": "gpt-5.3-codex",
+            "base_url": None,
+            "api_mode": None,
+        }
+        assert data["fallbacks"] == [
+            {
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-chat",
+                "base_url": None,
+                "api_mode": None,
+            }
+        ]
+        assert data["restart_required"] is False
+
+    @pytest.mark.asyncio
+    async def test_model_policy_apply_persists_without_exposing_secrets(
+        self,
+        auth_adapter,
+        monkeypatch,
+    ):
+        from hermes_cli.config import get_config_path
+
+        config_path = get_config_path()
+        config_path.write_text(
+            "model:\n"
+            "  provider: openrouter\n"
+            "  default: deepseek/deepseek-chat\n",
+            encoding="utf-8",
+        )
+
+        def fake_switch_model(raw_input, explicit_provider, **_kwargs):
+            return SimpleNamespace(
+                success=True,
+                new_model=raw_input,
+                target_provider=explicit_provider,
+                api_key=f"secret-for-{explicit_provider}",
+                base_url=(
+                    "https://api.openai.com/v1"
+                    if explicit_provider == "openai-codex"
+                    else "https://openrouter.ai/api/v1"
+                ),
+                api_mode=(
+                    "codex_responses"
+                    if explicit_provider == "openai-codex"
+                    else "chat_completions"
+                ),
+            )
+
+        monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/apply",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={
+                    "primary": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.3-codex",
+                    },
+                    "fallbacks": [
+                        {
+                            "provider": "openrouter",
+                            "model": "deepseek/deepseek-chat",
+                        }
+                    ],
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert data["applied"] is True
+        assert data["restart_required"] is False
+        assert "secret-for-openai-codex" not in str(data)
+        assert "secret-for-openrouter" not in str(data)
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["model"]["provider"] == "openai-codex"
+        assert saved["model"]["default"] == "gpt-5.3-codex"
+        assert saved["model"]["base_url"] == "https://api.openai.com/v1"
+        assert saved["fallback_providers"] == [
+            {
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-chat",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            }
+        ]
+        assert "secret-for" not in config_path.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_model_policy_validate_rejects_invalid_policy(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/model-policy/validate",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"primary": {"provider": "openai-codex"}},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+
+        assert data["valid"] is False
+        assert data["errors"] == [
+            {"path": "primary.model", "message": "Model is required."}
+        ]
 
 
 # ---------------------------------------------------------------------------

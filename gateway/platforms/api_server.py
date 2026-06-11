@@ -59,6 +59,10 @@ from gateway.platforms.base import (
     is_network_accessible,
 )
 from agent.redact import redact_sensitive_text
+from gateway.platforms.api_server_provider_control import (
+    provider_control_capabilities,
+    register_provider_control_routes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1237,6 +1241,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        provider_control = provider_control_capabilities()
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1267,6 +1272,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                **provider_control["features"],
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
@@ -1292,6 +1298,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                **provider_control["endpoints"],
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4523,6 +4530,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            register_provider_control_routes(self._app, self)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
