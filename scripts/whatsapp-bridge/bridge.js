@@ -45,6 +45,7 @@ const WHATSAPP_DEBUG =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const PAIRING_STATUS_FILE = path.join(SESSION_DIR, 'pairing.json');
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
@@ -65,6 +66,22 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function writePairingStatus(data) {
+  try {
+    let existing = {};
+    if (existsSync(PAIRING_STATUS_FILE)) {
+      try {
+        existing = JSON.parse(readFileSync(PAIRING_STATUS_FILE, 'utf8'));
+      } catch {}
+    }
+    writeFileSync(PAIRING_STATUS_FILE, JSON.stringify({
+      ...existing,
+      ...data,
+      updated_at: new Date().toISOString(),
+    }, null, 2), { mode: 0o600 });
+  } catch {}
 }
 
 function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
@@ -205,7 +222,16 @@ async function startSocket() {
 
     if (qr) {
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
-      qrcode.generate(qr, { small: true });
+      qrcode.generate(qr, { small: true }, (terminalQr) => {
+        console.log(terminalQr);
+        writePairingStatus({
+          status: 'qr_ready',
+          mode: WHATSAPP_MODE,
+          qr,
+          qr_terminal: terminalQr,
+          started_at: new Date().toISOString(),
+        });
+      });
       console.log('\nWaiting for scan...\n');
     }
 
@@ -215,6 +241,11 @@ async function startSocket() {
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+        writePairingStatus({
+          status: 'logged_out',
+          mode: WHATSAPP_MODE,
+          error_message: 'WhatsApp logged out. Start pairing again.',
+        });
         process.exit(1);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
@@ -228,6 +259,12 @@ async function startSocket() {
     } else if (connection === 'open') {
       connectionState = 'connected';
       console.log('✅ WhatsApp connected!');
+      writePairingStatus({
+        status: 'paired',
+        mode: WHATSAPP_MODE,
+        qr: null,
+        qr_terminal: null,
+      });
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
         // Give Baileys a moment to flush creds, then exit cleanly
