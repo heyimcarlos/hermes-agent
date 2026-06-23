@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - tryagent-v2026.6.11.3
+      - tryagent-v2026.7.4
 
 permissions:
   contents: read
@@ -39,5 +39,5 @@ jobs:
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
           tags: |
-            ghcr.io/heyimcarlos/hermes-agent:tryagent-v2026.6.11.3
-            ghcr.io/heyimcarlos/hermes-agent:tryagent-v2026.6.11.3-${{ github.sha }}
+            ghcr.io/heyimcarlos/hermes-agent:tryagent-v2026.7.4
+            ghcr.io/heyimcarlos/hermes-agent:tryagent-v2026.7.4-${{ github.sha }}
