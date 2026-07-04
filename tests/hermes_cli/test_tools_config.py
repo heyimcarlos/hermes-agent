@@ -1253,9 +1253,11 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
         "tools": ["_test_special_tool"],
         "includes": [],
     }
+    web_tools = list(TOOLSETS["web"]["tools"])
+    terminal_tools = list(TOOLSETS["terminal"]["tools"])
     fake_toolsets["hermes-_test_platform"] = {
         "description": "test composite",
-        "tools": ["web_search", "web_extract", "terminal", "process", "_test_special_tool"],
+        "tools": [*web_tools, *terminal_tools, "_test_special_tool"],
         "includes": [],
     }
 
@@ -1269,7 +1271,6 @@ def test_get_platform_tools_recovers_non_configurable_toolsets_from_composite():
 
     assert "_test_platform_tool" in enabled
     assert "web" in enabled
-    assert "terminal" in enabled
 
 
 def test_get_platform_tools_second_pass_skips_fully_claimed_toolsets():

@@ -4767,7 +4767,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
         if resolve_runtime:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs = dict(_resolve_runtime_agent_kwargs())
+            runtime_model = runtime_kwargs.pop("model", None)
+            if runtime_model:
+                policy["model"] = runtime_model
             if max_tokens is not None:
                 runtime_kwargs["max_tokens"] = max_tokens
             policy["runtime_kwargs"] = runtime_kwargs

@@ -57,10 +57,27 @@ def preserve_virtualenv_path_prelude() -> str:
     """Shell prelude that keeps an activated Python venv visible after login rc.
 
     Some login shells reset PATH after Docker/systemd entrypoints activate the
-    Hermes venv. The Python process still has VIRTUAL_ENV, so re-prepend its
-    bin dir before capturing or running terminal commands.
+    Hermes venv. Terminal subprocesses intentionally strip VIRTUAL_ENV to avoid
+    cross-project Python tooling clobbering the Gateway venv, so embed the
+    parent process venv bin dir when available and fall back to a dynamic
+    VIRTUAL_ENV check for callers that still pass the marker through.
     """
-    return (
+    parts = []
+    parent_virtualenv = os.environ.get("VIRTUAL_ENV")
+    if parent_virtualenv:
+        parent_bin = os.path.join(parent_virtualenv, "bin")
+        quoted_parent_bin = shlex.quote(parent_bin)
+        parts.append(
+            f"__hermes_parent_venv_bin={quoted_parent_bin}\n"
+            f"if [ -d \"$__hermes_parent_venv_bin\" ]; then\n"
+            f"  case \":${{PATH:-}}:\" in\n"
+            f"    *\":$__hermes_parent_venv_bin:\"*) ;;\n"
+            f"    *) export PATH=\"$__hermes_parent_venv_bin:${{PATH:-}}\" ;;\n"
+            f"  esac\n"
+            f"fi\n"
+            f"unset __hermes_parent_venv_bin"
+        )
+    parts.append(
         'if [ -n "${VIRTUAL_ENV:-}" ] && [ -d "${VIRTUAL_ENV}/bin" ]; then\n'
         '  case ":${PATH:-}:" in\n'
         '    *":${VIRTUAL_ENV}/bin:"*) ;;\n'
@@ -68,6 +85,7 @@ def preserve_virtualenv_path_prelude() -> str:
         "  esac\n"
         "fi"
     )
+    return "\n".join(parts)
 
 
 def touch_activity_if_due(

@@ -444,7 +444,7 @@ class TestAdapterInit:
                 "model": "anthropic/claude-haiku",  # from the fallback entry
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "primary/model")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *_: "primary/model")
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
@@ -482,7 +482,7 @@ class TestAdapterInit:
                 "api_mode": "chat_completions",
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "primary/model")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *_: "primary/model")
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
