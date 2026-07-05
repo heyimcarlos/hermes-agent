@@ -36,6 +36,7 @@ import shlex
 import site
 import sys
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -785,6 +786,231 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
         return bool(mt.get("enabled", False))
     # Allow a bare ``message_timestamps: true`` shorthand.
     return bool(mt)
+
+
+_TRYAGENT_RECALL_PHRASE_TERMS = (
+    "phrase",
+    "preference",
+    "preferences",
+    "codename",
+    "codenames",
+    "project",
+    "projects",
+    "person",
+    "people",
+    "decision",
+    "decisions",
+    "commitment",
+    "commitments",
+)
+
+_TRYAGENT_GBRAIN_RECALL_TIMEOUT_SECS = 25
+_TRYAGENT_GBRAIN_RECALL_MAX_CHARS = 6000
+_TRYAGENT_GBRAIN_MCP_TOOLSETS = ("gbrain", "mcp-gbrain")
+
+
+def _tryagent_configured_box_brain_provider() -> Optional[str]:
+    """Return TryAgent's configured Box Brain provider from setup state."""
+
+    setup_path = _hermes_home / ".tryagent" / "memory" / "setup.json"
+    try:
+        data = json.loads(setup_path.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if str(data.get("state") or "").lower() != "configured":
+        return None
+    provider = str(data.get("provider") or "").strip().lower()
+    return provider or None
+
+
+def _tryagent_is_owner_personal_recall(message: Any) -> bool:
+    """Detect natural durable-memory recall prompts for TryAgent Agent Boxes."""
+
+    if not isinstance(message, str):
+        return False
+    text = message.strip().lower()
+    if not text:
+        return False
+
+    if "what did i ask you to remember" in text:
+        return True
+    if "what did i tell you about" in text:
+        return True
+    if "do you remember my" in text:
+        return True
+    if "what was the thing i saved" in text:
+        return True
+
+    asks_about_my = re.search(r"\bwhat(?:'s| is| was| are| were)?\s+my\b", text)
+    if asks_about_my and any(term in text for term in _TRYAGENT_RECALL_PHRASE_TERMS):
+        return True
+
+    asks_cross_channel = any(
+        phrase in text
+        for phrase in (
+            "from discord",
+            "from telegram",
+            "from dashboard",
+            "in discord",
+            "in telegram",
+            "in dashboard",
+        )
+    )
+    if asks_cross_channel and any(term in text for term in ("remember", "saved", "phrase")):
+        return True
+
+    return False
+
+
+def _tryagent_gbrain_command() -> Optional[str]:
+    """Return the GBrain CLI path for TryAgent Agent Box memory recall."""
+
+    candidates = (
+        _hermes_home / ".local" / "bin" / "gbrain",
+        _hermes_home / ".bun" / "bin" / "gbrain",
+        _hermes_home / "home" / ".bun" / "bin" / "gbrain",
+        Path("/usr/local/bin/gbrain"),
+        Path("/usr/bin/gbrain"),
+    )
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _tryagent_gbrain_env() -> Dict[str, str]:
+    """Build a provider-native GBrain environment for hidden Box Brain recall."""
+
+    env = dict(os.environ)
+    hermes_home = str(_hermes_home)
+    env["HERMES_HOME"] = hermes_home
+    env["GBRAIN_HOME"] = hermes_home
+    env["GBRAIN_SOURCE"] = "box-brain"
+    path_parts = [
+        str(_hermes_home / ".local" / "bin"),
+        str(_hermes_home / ".bun" / "bin"),
+        str(_hermes_home / "home" / ".bun" / "bin"),
+        env.get("PATH", ""),
+    ]
+    env["PATH"] = os.pathsep.join(part for part in path_parts if part)
+    return env
+
+
+def _tryagent_disable_gbrain_mcp_toolsets(disabled_toolsets: Any) -> list[str]:
+    """Return disabled toolsets with model-visible GBrain MCP tools removed."""
+
+    if isinstance(disabled_toolsets, (list, tuple, set)):
+        current = [str(toolset) for toolset in disabled_toolsets if str(toolset).strip()]
+    elif disabled_toolsets:
+        current = [str(disabled_toolsets)]
+    else:
+        current = []
+
+    seen = set(current)
+    for toolset in _TRYAGENT_GBRAIN_MCP_TOOLSETS:
+        if toolset not in seen:
+            current.append(toolset)
+            seen.add(toolset)
+    return current
+
+
+def _tryagent_recall_turn_toolsets(disabled_toolsets: Any) -> tuple[list[str], list[str]]:
+    """Return model toolsets for a recall turn already backed by provider output."""
+
+    return [], _tryagent_disable_gbrain_mcp_toolsets(disabled_toolsets)
+
+
+def _tryagent_gbrain_recall_output(message: str) -> Optional[str]:
+    """Return fresh GBrain recall output for a natural owner-personal question."""
+
+    command = _tryagent_gbrain_command()
+    if not command:
+        logger.warning("TryAgent Box Brain recall skipped: gbrain command not found")
+        return None
+
+    env = _tryagent_gbrain_env()
+    attempts = (
+        ("query", [command, "query", message, "--limit", "5"]),
+        ("search", [command, "search", message, "--limit", "5"]),
+    )
+    last_error = ""
+    for label, args in attempts:
+        try:
+            completed = subprocess.run(
+                args,
+                cwd=str(_hermes_home),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_TRYAGENT_GBRAIN_RECALL_TIMEOUT_SECS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = f"{label} timed out"
+            continue
+        except OSError as exc:
+            last_error = f"{label} failed to start: {exc}"
+            continue
+
+        stdout = (completed.stdout or "").strip()
+        if completed.returncode == 0 and stdout:
+            if len(stdout) > _TRYAGENT_GBRAIN_RECALL_MAX_CHARS:
+                stdout = stdout[:_TRYAGENT_GBRAIN_RECALL_MAX_CHARS] + "\n[truncated]"
+            logger.info("TryAgent Box Brain recall fetched via gbrain %s", label)
+            return f"GBrain {label} results:\n{stdout}"
+
+        stderr = (completed.stderr or "").strip()
+        last_error = (
+            f"{label} exited {completed.returncode}: "
+            f"{stderr[:240] if stderr else 'no output'}"
+        )
+
+    logger.warning("TryAgent Box Brain recall lookup failed: %s", last_error)
+    return None
+
+
+def _tryagent_build_memory_context(message: str, recall_output: Optional[str]) -> str:
+    """Build API-only memory context for a TryAgent Box Brain recall turn."""
+
+    if recall_output:
+        body = (
+            "TryAgent Box Brain recall context for the current user turn.\n"
+            "Use this current provider output for owner-personal memory recall. "
+            "Prefer it over platform history, prior assistant answers, and the "
+            "Hermes user profile. This block is already the current provider "
+            "result; do not call GBrain, MCP, or other memory-provider tools "
+            "for this question.\n\n"
+            f"User question: {message}\n\n"
+            f"{recall_output}"
+        )
+    else:
+        body = (
+            "TryAgent Box Brain recall was attempted for the current user turn, "
+            "but the active provider did not return current context. Do not "
+            "answer owner-personal memory questions from platform history, prior "
+            "assistant answers, or the Hermes user profile alone. Tell the user "
+            "that Box Brain search is unavailable right now."
+        )
+
+    from agent.memory_manager import build_memory_context_block
+
+    return build_memory_context_block(body)
+
+
+def _tryagent_box_brain_recall_context_for_message(message: Any) -> Optional[str]:
+    """Build API-only TryAgent memory context for the current user turn."""
+
+    if _tryagent_configured_box_brain_provider() != "gbrain":
+        return None
+    if not _tryagent_is_owner_personal_recall(message):
+        return None
+    recall_output = _tryagent_gbrain_recall_output(message)
+    return _tryagent_build_memory_context(message, recall_output)
 
 
 def _build_gateway_agent_history(
@@ -16869,6 +17095,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            effective_enabled_toolsets = enabled_toolsets
+            effective_disabled_toolsets = disabled_toolsets
+            _tryagent_recall_context = _tryagent_box_brain_recall_context_for_message(message)
+            if _tryagent_recall_context:
+                combined_ephemeral = (
+                    combined_ephemeral + "\n\n" + _tryagent_recall_context
+                ).strip()
+                (
+                    effective_enabled_toolsets,
+                    effective_disabled_toolsets,
+                ) = _tryagent_recall_turn_toolsets(
+                    disabled_toolsets
+                )
+                logger.info(
+                    "TryAgent Box Brain recall context injected for session %s",
+                    session_key or "?",
+                )
 
             max_iterations = _current_max_iterations()
             # Re-read .env and config for fresh credentials (gateway is long-lived,
@@ -17021,12 +17264,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_keys = self._extract_cache_busting_config(user_config)
+            if effective_enabled_toolsets != enabled_toolsets:
+                _cache_keys["tryagent.recall_enabled_toolsets"] = tuple(
+                    effective_enabled_toolsets or []
+                )
+            if effective_disabled_toolsets != disabled_toolsets:
+                _cache_keys["tryagent.recall_disabled_toolsets"] = tuple(
+                    effective_disabled_toolsets or []
+                )
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
-                enabled_toolsets,
+                effective_enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_keys,
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
@@ -17149,8 +17401,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
-                    enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
+                    enabled_toolsets=effective_enabled_toolsets,
+                    disabled_toolsets=effective_disabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
